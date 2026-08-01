@@ -300,9 +300,12 @@ class TransferEngine:
 
         await self._with_retries(client, cfg, lambda: self._transfer(client, cfg, msgs, reply_map))
 
+        sent_count = 0
         for m in msgs:
-            await db.mark_transferred(src_id, dst_id, m.id, cfg.sid, cfg.mode)
-        result.success += len(msgs)
+            if m.id in reply_map:
+                await db.mark_transferred(src_id, dst_id, m.id, cfg.sid, cfg.mode)
+                sent_count += 1
+        result.success += sent_count
 
     async def _with_retries(self, client, cfg, fn) -> None:
         attempts = 0
@@ -371,12 +374,14 @@ class TransferEngine:
         ids = [m.id for m in msgs]
         as_album = len(msgs) > 1
         drop_captions = "remove_captions" in cfg.options
+        drop_author = "hide_header" in cfg.options
         sent = await client.forward_messages(
             cfg.dest_entity,
             ids,
             from_peer=cfg.source_entity,
             as_album=as_album,
             drop_media_captions=drop_captions,
+            drop_author=drop_author,
             silent=cfg.silent,
         )
         if as_album:
@@ -488,23 +493,18 @@ class TransferEngine:
         return None
 
     async def _download_transfer(self, client, cfg, msgs: list, reply_map: dict) -> None:
-        ids = [m.id for m in msgs]
-        as_album = len(msgs) > 1
-        drop_captions = "remove_captions" in cfg.options
+        text_only = "text_only" in cfg.options
+        media_only = "media_only" in cfg.options
+        drop_caption = "remove_captions" in cfg.options
 
-        for m in msgs:
-            reply_to = None
-            if m.reply_to and m.reply_to.reply_to_msg_id:
-                reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
-
-            text_only = "text_only" in cfg.options
-            media_only = "media_only" in cfg.options
-            drop_caption = "remove_captions" in cfg.options
-
-            if text_only:
+        if text_only:
+            for m in msgs:
                 text = m.text
                 if not text:
                     continue
+                reply_to = None
+                if m.reply_to and m.reply_to.reply_to_msg_id:
+                    reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
                 sent = await client.send_message(
                     cfg.dest_entity,
                     text,
@@ -514,49 +514,124 @@ class TransferEngine:
                     silent=cfg.silent,
                 )
                 reply_map[m.id] = sent.id
-                continue
+            return
 
-            if media_only:
-                text = ""
-            else:
-                text = "" if drop_caption else (m.text or "")
+        is_album = len(msgs) > 1
+        if media_only:
+            caption = ""
+        else:
+            caption = "" if drop_caption else (msgs[0].text or "")
 
+        media_msgs = []
+        text_msgs = []
+        for m in msgs:
             media = m.media
             is_webpage = isinstance(media, types.MessageMediaWebPage)
-
             if media and not is_webpage:
-                try:
-                    tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}")
-                    path = await client.download_media(m, file=tmp_path)
-                    if path:
+                media_msgs.append(m)
+            elif m.text:
+                text_msgs.append(m)
+
+        if media_msgs:
+            try:
+                if is_album:
+                    paths = []
+                    for m in media_msgs:
+                        ext = _media_extension(m)
+                        tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
+                        path = await client.download_media(m, file=tmp_path)
+                        if path:
+                            paths.append(path)
+                    if paths:
                         sent = await client.send_file(
                             cfg.dest_entity,
-                            path,
-                            caption=text,
-                            formatting_entities=m.entities,
-                            parse_mode=None,
-                            reply_to=reply_to,
+                            paths,
+                            caption=caption,
                             silent=cfg.silent,
                         )
-                        reply_map[m.id] = sent.id
+                        if isinstance(sent, list) and len(sent) == len(paths):
+                            for m, s in zip(media_msgs, sent):
+                                reply_map[m.id] = s.id
+                        else:
+                            for m in media_msgs:
+                                reply_map[m.id] = sent.id
+                        for p in paths:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                else:
+                    for m in media_msgs:
+                        ext = _media_extension(m)
+                        tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
+                        path = None
                         try:
-                            os.remove(path)
-                        except OSError:
-                            pass
-                        continue
-                except Exception as exc:
-                    log.warning("download/upload failed for msg %s: %s", m.id, exc)
+                            path = await client.download_media(m, file=tmp_path)
+                            if path:
+                                reply_to = None
+                                if m.reply_to and m.reply_to.reply_to_msg_id:
+                                    reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
+                                sent = await client.send_file(
+                                    cfg.dest_entity,
+                                    path,
+                                    caption=caption,
+                                    formatting_entities=m.entities,
+                                    parse_mode=None,
+                                    reply_to=reply_to,
+                                    silent=cfg.silent,
+                                )
+                                reply_map[m.id] = sent.id
+                        except Exception as exc:
+                            log.warning("download/upload failed for msg %s: %s", m.id, exc)
+                        finally:
+                            if path and os.path.exists(path):
+                                try:
+                                    os.remove(path)
+                                except OSError:
+                                    pass
+            except Exception as exc:
+                log.warning("album download/upload failed: %s", exc)
 
-            if text:
-                sent = await client.send_message(
-                    cfg.dest_entity,
-                    text,
-                    formatting_entities=m.entities,
-                    parse_mode=None,
-                    reply_to=reply_to,
-                    silent=cfg.silent,
-                )
-                reply_map[m.id] = sent.id
+        for m in text_msgs:
+            if m in media_msgs:
+                continue
+            reply_to = None
+            if m.reply_to and m.reply_to.reply_to_msg_id:
+                reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
+            sent = await client.send_message(
+                cfg.dest_entity,
+                m.text,
+                formatting_entities=m.entities,
+                parse_mode=None,
+                reply_to=reply_to,
+                silent=cfg.silent,
+            )
+            reply_map[m.id] = sent.id
+
+
+def _media_extension(msg) -> str:
+    media = msg.media
+    if isinstance(media, types.MessageMediaDocument) and media.document:
+        mime = (media.document.mime_type or "").lower()
+        return _mime_to_ext(mime)
+    if isinstance(media, types.MessageMediaPhoto):
+        return ".jpg"
+    return ""
+
+
+def _mime_to_ext(mime: str) -> str:
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "video/mp4": ".mp4",
+        "video/x-matroska": ".mkv",
+        "audio/mpeg": ".mp3",
+        "audio/ogg": ".ogg",
+        "application/pdf": ".pdf",
+        "application/zip": ".zip",
+    }.get(mime, "")
 
 
 class _Abort(Exception):

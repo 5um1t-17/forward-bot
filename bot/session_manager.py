@@ -45,9 +45,14 @@ class SessionManager:
     async def get_decrypted_all(self, user_id: int) -> list[dict]:
         """Return user sessions with decrypted session strings attached."""
         docs = await db.get_user_sessions(user_id)
+        result = []
         for doc in docs:
-            doc["_session_string"] = self.crypto.decrypt(doc["encrypted_session"])
-        return docs
+            try:
+                doc["_session_string"] = self.crypto.decrypt(doc["encrypted_session"])
+                result.append(doc)
+            except ValueError:
+                log.warning("Skipping corrupted session %s for user %s", doc.get("sid"), user_id)
+        return result
 
 
 session_manager = SessionManager()

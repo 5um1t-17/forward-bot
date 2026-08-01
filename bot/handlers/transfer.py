@@ -221,38 +221,38 @@ async def _on_option(bot, event, uid: int, key: str) -> bool:
         if "keep_sender" in opts:
             opts.discard("keep_sender")
         else:
-            if wiz.mode != "download":
-                wiz.mode = "forward"
-                opts.add("keep_sender")
-                opts.discard("hide_header")
-                opts.discard("text_only")
-                opts.discard("media_only")
+            opts.add("keep_sender")
+            opts.discard("hide_header")
+            opts.discard("text_only")
+            opts.discard("media_only")
     elif key == "hide_header":
         if "hide_header" in opts:
             opts.discard("hide_header")
         else:
-            if wiz.mode != "download":
-                wiz.mode = "copy"
-                opts.add("hide_header")
-                opts.discard("keep_sender")
+            opts.add("hide_header")
+            opts.discard("keep_sender")
+            opts.discard("text_only")
+            opts.discard("media_only")
     elif key == "remove_captions":
         opts.symmetric_difference_update({"remove_captions"})
     elif key == "text_only":
-        if wiz.mode == "download":
-            opts.symmetric_difference_update({"text_only"})
-            if "text_only" in opts:
-                opts.discard("media_only")
+        if "text_only" in opts:
+            opts.discard("text_only")
         else:
             opts.add("text_only")
             opts.discard("media_only")
+            if wiz.mode in ("forward", "copy"):
+                wiz.mode = "copy"
+                opts.discard("keep_sender")
     elif key == "media_only":
-        if wiz.mode == "download":
-            opts.symmetric_difference_update({"media_only"})
-            if "media_only" in opts:
-                opts.discard("text_only")
+        if "media_only" in opts:
+            opts.discard("media_only")
         else:
             opts.add("media_only")
             opts.discard("text_only")
+            if wiz.mode in ("forward", "copy"):
+                wiz.mode = "copy"
+                opts.discard("keep_sender")
     await edit(event, text.options_prompt(wiz.mode, opts), keyboards.options_keyboard(wiz.mode, opts))
     return True
 
@@ -397,8 +397,6 @@ async def _run(bot, event, uid: int) -> bool:
 
 async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
     """Shared runner used by the wizard and saved jobs."""
-    from bot.transfer_engine import TransferResult
-
     settings = await db.get_settings(uid)
     progress_msg = await bot.send_message(
         uid,

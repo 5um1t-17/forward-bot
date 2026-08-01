@@ -359,7 +359,13 @@ def stats_text(user: dict, settings_: dict, per_mode: list[dict], total: int,
     ]
     if per_mode:
         for m in per_mode:
-            label = "🔁 Forward" if m["_id"] == "forward" else "📄 Copy"
+            mode_id = m.get("_id", "")
+            if mode_id == "forward":
+                label = "🔁 Forward"
+            elif mode_id == "download":
+                label = "⬇️ Download"
+            else:
+                label = "📄 Copy"
             lines.append(f"  {label}: <b>{m['count']}</b>")
     else:
         lines.append("  (none yet)")

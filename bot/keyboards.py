@@ -126,7 +126,6 @@ def options_keyboard(mode: str, options: set[str]) -> list[list]:
     else:
         def mark(key: str) -> str:
             return "✅ " if key in options else "☑️ "
-        kb.append([Button.inline(f"{mark('hide_header')}Hide Forward Header", b"tr:opt:hide_header")])
         kb.append([Button.inline(f"{mark('remove_captions')}Remove Captions", b"tr:opt:remove_captions")])
         kb.append([Button.inline(f"{mark('text_only')}Copy Text Only", b"tr:opt:text_only")])
         kb.append([Button.inline(f"{mark('media_only')}Copy Media Only", b"tr:opt:media_only")])
