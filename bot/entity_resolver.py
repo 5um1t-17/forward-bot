@@ -10,12 +10,18 @@ from telethon.errors import UsernameInvalidError, ChatIdInvalidError
 log = logging.getLogger("bot.resolve")
 
 # https://t.me/username / https://t.me/username/123 / t.me/c/<channel_id>/<msg_id>
+# https://t.me/joinchat/<hash> / https://t.me/+<id>
 TME_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me)/"
-    r"(?:joinchat/)?(?P<slug>[A-Za-z0-9_+-]{1,64})"
+    r"(?:"
+    r"joinchat/(?P<joinchat_slug>[A-Za-z0-9_+-]{1,64})"
+    r"|\+(?P<plus_slug>[A-Za-z0-9_+-]{1,64})"
+    r"|(?P<slug>[A-Za-z0-9_+-]{1,64})"
+    r")"
     r"(?:/(?P<msg>\d{1,15}))?"
 )
 # private-channel share link: t.me/c/<channel_id>/<msg_id>
+# also supports the private restricted-group form: t.me/c/<channel_id>/<msg_id>
 C_LINK_RE = re.compile(
     r"(?:https?://)?(?:t\.me|telegram\.me)/c/(?P<cid>\d{1,15})(?:/(?P<msg>\d{1,15}))?"
 )
@@ -58,8 +64,12 @@ def parse_input(text: str) -> dict:
 
     m = TME_RE.search(low)
     if m:
-        slug = m.group("slug")
         msg_id = int(m.group("msg")) if m.group("msg") else None
+        if m.group("joinchat_slug") is not None:
+            return {"kind": "message_link", "identifier": f"joinchat/{m.group('joinchat_slug')}", "msg_id": msg_id}
+        if m.group("plus_slug") is not None:
+            return {"kind": "message_link", "identifier": f"+{m.group('plus_slug')}", "msg_id": msg_id}
+        slug = m.group("slug")
         return {"kind": "message_link", "slug": slug, "msg_id": msg_id}
 
     if ID_RE.match(text):
@@ -92,7 +102,8 @@ async def resolve(client: TelegramClient, text: str) -> Resolved | None:
                 resolved = _to_resolved(entity, "message_link")
                 resolved.msg_id = parsed.get("msg_id")
                 return resolved
-            entity = await client.get_entity(parsed["slug"])
+            identifier = parsed.get("identifier") or parsed.get("slug")
+            entity = await client.get_entity(identifier)
             resolved = _to_resolved(entity, "message_link")
             resolved.msg_id = parsed.get("msg_id")
             return resolved

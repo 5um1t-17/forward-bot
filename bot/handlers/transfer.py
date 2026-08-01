@@ -653,7 +653,7 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         client = await client_pool.get(uid, sid)
         parsed = resolve.parse_input(event.raw_text)
         if parsed["kind"] == "unknown":
-            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123 or https://t.me/c/123456789/123")
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123, https://t.me/joinchat/abc123/123, or https://t.me/c/123456789/123")
             return True
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
@@ -662,7 +662,8 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
                     await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
                     return True
             else:
-                entity = await client.get_entity(parsed["slug"])
+                identifier = parsed.get("identifier") or parsed.get("slug")
+                entity = await client.get_entity(identifier)
             msg_id = parsed.get("msg_id")
         elif parsed["kind"] == "username":
             entity = await client.get_entity(parsed["username"])
@@ -671,7 +672,7 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
             entity = await client.get_entity(parsed["id"])
             msg_id = None
         else:
-            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123 or https://t.me/c/123456789/123")
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123, https://t.me/joinchat/abc123/123, or https://t.me/c/123456789/123")
             return True
         if msg_id is None:
             await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/123")
@@ -705,7 +706,7 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
         client = await client_pool.get(uid, sid)
         parsed = resolve.parse_input(event.raw_text)
         if parsed["kind"] == "unknown":
-            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500 or https://t.me/c/123456789/500")
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500, https://t.me/joinchat/abc123/500, or https://t.me/c/123456789/500")
             return True
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
@@ -715,7 +716,8 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
                     return True
                 end_chat_id = end_entity.id
             else:
-                end_entity = await client.get_entity(parsed["slug"])
+                end_identifier = parsed.get("identifier") or parsed.get("slug")
+                end_entity = await client.get_entity(end_identifier)
                 end_chat_id = end_entity.id
             end_msg_id = parsed.get("msg_id")
         else:
