@@ -320,7 +320,19 @@ class TransferEngine:
                 continue
             except _Abort:
                 raise
-            except (MessageIdInvalidError, ChatForwardsRestrictedError, MessageEmptyError):
+            except ChatForwardsRestrictedError:
+                if cfg.mode == "forward":
+                    log.info("Forwarding restricted, falling back to download mode")
+                    cfg.mode = "download"
+                    continue
+                attempts += 1
+                if cfg.retry_count == 0 or attempts <= cfg.retry_count:
+                    await self._sleep_interruptible(min(2 * attempts, 10))
+                    continue
+                if not cfg.auto_resume:
+                    raise _Abort()
+                raise
+            except (MessageIdInvalidError, MessageEmptyError):
                 attempts += 1
                 if cfg.retry_count == 0 or attempts <= cfg.retry_count:
                     await self._sleep_interruptible(min(2 * attempts, 10))
