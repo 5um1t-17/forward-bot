@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
@@ -347,8 +350,10 @@ class TransferEngine:
     async def _transfer(self, client, cfg, msgs: list, reply_map: dict) -> None:
         if cfg.mode == "forward":
             await self._forward(client, cfg, msgs, reply_map)
-        else:
+        elif cfg.mode == "copy":
             await self._copy(client, cfg, msgs, reply_map)
+        elif cfg.mode == "download":
+            await self._download_transfer(client, cfg, msgs, reply_map)
 
     async def _forward(self, client, cfg, msgs: list, reply_map: dict) -> None:
         ids = [m.id for m in msgs]
@@ -469,6 +474,77 @@ class TransferEngine:
             )
             return sent.id
         return None
+
+    async def _download_transfer(self, client, cfg, msgs: list, reply_map: dict) -> None:
+        ids = [m.id for m in msgs]
+        as_album = len(msgs) > 1
+        drop_captions = "remove_captions" in cfg.options
+
+        for m in msgs:
+            reply_to = None
+            if m.reply_to and m.reply_to.reply_to_msg_id:
+                reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
+
+            text_only = "text_only" in cfg.options
+            media_only = "media_only" in cfg.options
+            drop_caption = "remove_captions" in cfg.options
+
+            if text_only:
+                text = m.text
+                if not text:
+                    continue
+                sent = await client.send_message(
+                    cfg.dest_entity,
+                    text,
+                    formatting_entities=m.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                )
+                reply_map[m.id] = sent.id
+                continue
+
+            if media_only:
+                text = ""
+            else:
+                text = "" if drop_caption else (m.text or "")
+
+            media = m.media
+            is_webpage = isinstance(media, types.MessageMediaWebPage)
+
+            if media and not is_webpage:
+                try:
+                    tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}")
+                    path = await client.download_media(m, file=tmp_path)
+                    if path:
+                        sent = await client.send_file(
+                            cfg.dest_entity,
+                            path,
+                            caption=text,
+                            formatting_entities=m.entities,
+                            parse_mode=None,
+                            reply_to=reply_to,
+                            silent=cfg.silent,
+                        )
+                        reply_map[m.id] = sent.id
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                        continue
+                except Exception as exc:
+                    log.warning("download/upload failed for msg %s: %s", m.id, exc)
+
+            if text:
+                sent = await client.send_message(
+                    cfg.dest_entity,
+                    text,
+                    formatting_entities=m.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                )
+                reply_map[m.id] = sent.id
 
 
 class _Abort(Exception):

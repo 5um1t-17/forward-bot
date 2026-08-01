@@ -104,6 +104,7 @@ def mode_keyboard() -> list[list]:
     return [
         [Button.inline("🔁 Forward Messages", b"tr:mode:forward")],
         [Button.inline("📄 Copy Messages", b"tr:mode:copy")],
+        [Button.inline("⬇️ Download & Re-upload", b"tr:mode:download")],
         [Button.inline("🔙 Back", b"menu")],
     ]
 
@@ -116,6 +117,12 @@ def options_keyboard(mode: str, options: set[str]) -> list[list]:
         kb.append([Button.inline(f"{mark('keep_sender')}Keep Original Sender", b"tr:opt:keep_sender")])
         kb.append([Button.inline(f"{mark('hide_header')}Hide Forward Header", b"tr:opt:hide_header")])
         kb.append([Button.inline(f"{mark('remove_captions')}Remove Captions", b"tr:opt:remove_captions")])
+    elif mode == "download":
+        def mark(key: str) -> str:
+            return "✅ " if key in options else "☑️ "
+        kb.append([Button.inline(f"{mark('remove_captions')}Remove Captions", b"tr:opt:remove_captions")])
+        kb.append([Button.inline(f"{mark('text_only')}Text Only", b"tr:opt:text_only")])
+        kb.append([Button.inline(f"{mark('media_only')}Media Only", b"tr:opt:media_only")])
     else:
         def mark(key: str) -> str:
             return "✅ " if key in options else "☑️ "

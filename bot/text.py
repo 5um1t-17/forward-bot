@@ -151,7 +151,9 @@ def mode_prompt() -> str:
         "🔁 <b>Forward</b> — uses Telegram's native forwarding; keeps the "
         "'forwarded from' tag and original sender.\n\n"
         "📄 <b>Copy</b> — copies the message so the forwarded tag is removed. "
-        "Media stays on Telegram servers (no re-upload)."
+        "Media stays on Telegram servers (no re-upload).\n\n"
+        "⬇️ <b>Download</b> — downloads media and re-uploads it. Works even when "
+        "forwarding/copying is restricted in private groups."
     )
 
 
@@ -159,6 +161,8 @@ def options_prompt(mode: str, options: set[str]) -> str:
     head = "📥 <b>Step 5 — Options</b>\n\n"
     if mode == "forward":
         head += "Forwarding options:\n"
+    elif mode == "download":
+        head += "Download & Re-upload options:\n"
     else:
         head += "Copy options:\n"
 
@@ -171,6 +175,10 @@ def options_prompt(mode: str, options: set[str]) -> str:
         lines.append(row("keep_sender", "Keep Original Sender"))
         lines.append(row("hide_header", "Hide Forward Header"))
         lines.append(row("remove_captions", "Remove Captions"))
+    elif mode == "download":
+        lines.append(row("remove_captions", "Remove Captions"))
+        lines.append(row("text_only", "Text Only"))
+        lines.append(row("media_only", "Media Only"))
     else:
         lines.append(row("hide_header", "Hide Forward Header"))
         lines.append(row("remove_captions", "Remove Captions"))
@@ -235,7 +243,7 @@ def summary(cfg: dict, src: dict, dst: dict) -> str:
         if schedule == "weekly":
             sched_txt += f" ({cfg.get('schedule_weekday', '?')})"
 
-    mode_txt = "🔁 Forward" if cfg.get("mode") == "forward" else "📄 Copy"
+    mode_txt = "🔁 Forward" if cfg.get("mode") == "forward" else ("📄 Copy" if cfg.get("mode") == "copy" else "⬇️ Download")
 
     return (
         "📋 <b>Transfer Summary</b>\n\n"
@@ -260,7 +268,12 @@ def _bar(fraction: float, width: int = 12) -> str:
 def progress_text(done: int, total: int, elapsed: float, speed: float,
                   skipped: int, failed: int, mode: str, dark: bool = False) -> str:
     fraction = done / total if total else 0.0
-    verb = "Forwarding" if mode == "forward" else "Copying"
+    if mode == "forward":
+        verb = "Forwarding"
+    elif mode == "download":
+        verb = "Downloading"
+    else:
+        verb = "Copying"
     icon = "🌙" if dark else "☀️"
     lines = [
         f"{icon} <b>{verb}...</b>",

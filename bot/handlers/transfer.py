@@ -203,6 +203,11 @@ async def _on_mode(bot, event, uid: int, mode: str) -> bool:
         wiz.options.add("keep_sender")
         wiz.options.discard("text_only")
         wiz.options.discard("media_only")
+    elif mode == "download":
+        wiz.options.discard("keep_sender")
+        wiz.options.discard("hide_header")
+        wiz.options.discard("text_only")
+        wiz.options.discard("media_only")
     else:
         wiz.options.discard("keep_sender")
     await edit(event, text.options_prompt(mode, wiz.options), keyboards.options_keyboard(mode, wiz.options))
@@ -216,28 +221,38 @@ async def _on_option(bot, event, uid: int, key: str) -> bool:
         if "keep_sender" in opts:
             opts.discard("keep_sender")
         else:
-            # keeping the sender forces native forwarding
-            wiz.mode = "forward"
-            opts.add("keep_sender")
-            opts.discard("hide_header")
-            opts.discard("text_only")
-            opts.discard("media_only")
+            if wiz.mode != "download":
+                wiz.mode = "forward"
+                opts.add("keep_sender")
+                opts.discard("hide_header")
+                opts.discard("text_only")
+                opts.discard("media_only")
     elif key == "hide_header":
-        # hiding the header requires a copy
         if "hide_header" in opts:
             opts.discard("hide_header")
         else:
-            wiz.mode = "copy"
-            opts.add("hide_header")
-            opts.discard("keep_sender")
+            if wiz.mode != "download":
+                wiz.mode = "copy"
+                opts.add("hide_header")
+                opts.discard("keep_sender")
     elif key == "remove_captions":
         opts.symmetric_difference_update({"remove_captions"})
     elif key == "text_only":
-        opts.add("text_only")
-        opts.discard("media_only")
+        if wiz.mode == "download":
+            opts.symmetric_difference_update({"text_only"})
+            if "text_only" in opts:
+                opts.discard("media_only")
+        else:
+            opts.add("text_only")
+            opts.discard("media_only")
     elif key == "media_only":
-        opts.add("media_only")
-        opts.discard("text_only")
+        if wiz.mode == "download":
+            opts.symmetric_difference_update({"media_only"})
+            if "media_only" in opts:
+                opts.discard("text_only")
+        else:
+            opts.add("media_only")
+            opts.discard("text_only")
     await edit(event, text.options_prompt(wiz.mode, opts), keyboards.options_keyboard(wiz.mode, opts))
     return True
 
