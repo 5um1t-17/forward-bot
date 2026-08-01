@@ -738,7 +738,8 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
             f"Total: <b>{end_msg_id - wiz.custom_start + 1}</b> messages",
             parse_mode="html",
         )
-        return await _ask_mode(bot, event, uid)
+        await event.respond(text.mode_prompt(), buttons=keyboards.mode_keyboard(), parse_mode="html")
+        return True
     except Exception as exc:
         log.warning("end link resolve error: %s", exc)
         await event.respond(
