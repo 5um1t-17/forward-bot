@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 from telethon import events
+from telethon.errors import MessageNotModifiedError
 
 from bot.config import config
 
@@ -24,5 +25,7 @@ async def answer(event: events.CallbackQuery.Event, text: str | None = None, ale
 async def edit(event: events.CallbackQuery.Event, text: str, kb=None) -> None:
     try:
         await event.edit(text, buttons=kb, parse_mode="html")
+    except MessageNotModifiedError:
+        pass
     except Exception:
         log.warning("edit failed", exc_info=True)
