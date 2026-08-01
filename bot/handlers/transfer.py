@@ -11,7 +11,7 @@ from telethon.errors import MessageNotModifiedError, MessageIdInvalidError
 from bot import keyboards, text
 from bot.client_pool import client_pool
 from bot.db import db, now
-from bot.entity_resolver import fetch_sendable_dialogs, resolve, resolve_forwarded
+from bot.entity_resolver import fetch_sendable_dialogs, parse_input, resolve, resolve_forwarded, _resolve_private_channel
 from bot.handlers.common import answer, edit
 from bot.scheduler import _compute_next, schedule_instant
 from bot.state import TransferWizard, store
@@ -651,13 +651,13 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         return True
     try:
         client = await client_pool.get(uid, sid)
-        parsed = resolve.parse_input(event.raw_text)
+        parsed = parse_input(event.raw_text)
         if parsed["kind"] == "unknown":
             await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123, https://t.me/joinchat/abc123/123, or https://t.me/c/123456789/123")
             return True
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
-                entity = await resolve._resolve_private_channel(client, parsed["cid"])
+                entity = await _resolve_private_channel(client, parsed["cid"])
                 if entity is None:
                     await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
                     return True
@@ -704,13 +704,13 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
         return True
     try:
         client = await client_pool.get(uid, sid)
-        parsed = resolve.parse_input(event.raw_text)
+        parsed = parse_input(event.raw_text)
         if parsed["kind"] == "unknown":
             await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500, https://t.me/joinchat/abc123/500, or https://t.me/c/123456789/500")
             return True
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
-                end_entity = await resolve._resolve_private_channel(client, parsed["cid"])
+                end_entity = await _resolve_private_channel(client, parsed["cid"])
                 if end_entity is None:
                     await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
                     return True
