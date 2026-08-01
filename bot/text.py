@@ -147,10 +147,19 @@ def custom_end_prompt() -> str:
 
 def link_start_prompt() -> str:
     return (
-        "🔗 <b>From Message Link</b>\n\n"
-        "Send a <b>message link</b> from the source chat.\n"
-        "All messages from that message to the latest will be transferred.\n\n"
+        "🔗 <b>From Message Link — Step 1/2</b>\n\n"
+        "Send the <b>start message link</b> from the source chat.\n\n"
         "Example: <code>https://t.me/channel/123</code>\n\n"
+        "Use /cancel to abort."
+    )
+
+
+def link_end_prompt() -> str:
+    return (
+        "🔗 <b>From Message Link — Step 2/2</b>\n\n"
+        "Now send the <b>end message link</b> from the same source chat.\n\n"
+        "Example: <code>https://t.me/channel/500</code>\n\n"
+        "All messages from the start to the end will be transferred.\n\n"
         "Use /cancel to abort."
     )
 

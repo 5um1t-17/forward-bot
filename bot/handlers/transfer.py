@@ -185,7 +185,7 @@ async def _on_count(bot, event, uid: int, value: str) -> bool:
         await edit(event, text.custom_start_prompt(), keyboards.back_row())
         return True
     if value == "link":
-        store.set_pending(uid, "tr_link")
+        store.set_pending(uid, "tr_link_start")
         await edit(event, text.link_start_prompt(), keyboards.back_row())
         return True
     wiz.count_mode = "latest"
@@ -563,8 +563,10 @@ async def handle_pending(bot, event: events.NewMessage.Event, kind: str) -> bool
         return await _on_sched_time(bot, event, uid)
     if kind == "tr_job_name":
         return await _on_job_name(bot, event, uid)
-    if kind == "tr_link":
-        return await _on_link_input(bot, event, uid)
+    if kind == "tr_link_start":
+        return await _on_link_start_input(bot, event, uid)
+    if kind == "tr_link_end":
+        return await _on_link_end_input(bot, event, uid)
     return False
 
 
@@ -641,7 +643,7 @@ async def _on_end_id(bot, event, uid: int) -> bool:
     return True
 
 
-async def _on_link_input(bot, event, uid: int) -> bool:
+async def _on_link_start_input(bot, event, uid: int) -> bool:
     wiz = store.get_transfer(uid)
     sid = await db.get_active_sid(uid)
     if not sid:
@@ -671,22 +673,55 @@ async def _on_link_input(bot, event, uid: int) -> bool:
         if msg_id is None:
             await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/123")
             return True
-        latest = await client.get_messages(entity, limit=1)
-        latest_id = latest[0].id if isinstance(latest, list) and latest else latest.id
         wiz.source = {"id": entity.id, "name": getattr(entity, "title", getattr(entity, "username", str(entity.id)))}
-        wiz.count_mode = "custom"
         wiz.custom_start = msg_id
-        wiz.custom_end = latest_id
+        store.set_pending(uid, "tr_link_end")
+        await event.respond(
+            f"✅ <b>Start message set</b> — <code>{msg_id}</code>\n\n"
+            f"Now send the <b>end message link</b> from the same chat.",
+            parse_mode="html",
+        )
+        return True
+    except Exception as exc:
+        log.warning("link resolve error: %s", exc)
+        await event.respond(f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>", parse_mode="html")
+        return True
+
+
+async def _on_link_end_input(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    try:
+        parsed = resolve.parse_input(event.raw_text)
+        if parsed["kind"] == "unknown":
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500")
+            return True
+        if parsed["kind"] == "username":
+            await event.respond("⚠️ Send a message link with a message ID, not just a username.")
+            return True
+        if parsed["kind"] == "channel_id":
+            await event.respond("⚠️ Send a message link with a message ID, not just an ID.")
+            return True
+        slug = parsed.get("slug")
+        cid = parsed.get("cid")
+        end_msg_id = parsed.get("msg_id")
+        if end_msg_id is None:
+            await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/500")
+            return True
+        if wiz.source["id"] != (resolve._tme_c_channel_id(cid) if slug == "c" else (await client_pool.get(uid, await db.get_active_sid(uid))).get_entity(slug if slug != "c" else resolve._tme_c_channel_id(cid)).id):
+            await event.respond("⚠️ The end link must be from the same source chat as the start link.")
+            return True
+        wiz.custom_end = end_msg_id
+        wiz.count_mode = "custom"
         store.set_pending(uid, None)
         await event.respond(
-            f"✅ <b>Start message set</b>\n\n"
-            f"From message ID <code>{msg_id}</code> to latest (<code>{latest_id}</code>)\n"
-            f"Total: <b>{latest_id - msg_id + 1}</b> messages",
+            f"✅ <b>Range set</b>\n\n"
+            f"From message <code>{wiz.custom_start}</code> to <code>{end_msg_id}</code>\n"
+            f"Total: <b>{end_msg_id - wiz.custom_start + 1}</b> messages",
             parse_mode="html",
         )
         return await _ask_mode(bot, event, uid)
     except Exception as exc:
-        log.warning("link resolve error: %s", exc)
+        log.warning("end link resolve error: %s", exc)
         await event.respond(f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>", parse_mode="html")
         return True
 
