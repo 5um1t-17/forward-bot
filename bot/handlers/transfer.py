@@ -574,6 +574,10 @@ async def _on_source_input(bot, event, uid: int) -> bool:
             resolved = await resolve_forwarded(client, event.message)
         else:
             resolved = await resolve(client, event.raw_text)
+    except ValueError as exc:
+        log.warning("source resolve error: %s", exc)
+        await event.respond("⚠️ Session issue: please go to 👤 Accounts → 🗑 Delete Account, then ➕ Add Account again.")
+        return True
     except Exception as exc:
         log.warning("source resolve error: %s", exc)
         await event.respond(f"⚠️ Resolution failed: <code>{str(exc)[:200]}</code>")
