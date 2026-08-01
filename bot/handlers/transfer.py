@@ -655,21 +655,24 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         if parsed["kind"] == "unknown":
             await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123 or https://t.me/c/123456789/123")
             return True
-        if parsed["kind"] == "username":
+        if parsed["kind"] == "message_link":
+            if parsed.get("slug") == "c":
+                entity = await resolve._resolve_private_channel(client, parsed["cid"])
+                if entity is None:
+                    await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
+                    return True
+            else:
+                entity = await client.get_entity(parsed["slug"])
+            msg_id = parsed.get("msg_id")
+        elif parsed["kind"] == "username":
             entity = await client.get_entity(parsed["username"])
             msg_id = None
         elif parsed["kind"] == "channel_id":
             entity = await client.get_entity(parsed["id"])
             msg_id = None
         else:
-            slug = parsed.get("slug")
-            cid = parsed.get("cid")
-            msg_id = parsed.get("msg_id")
-            if slug == "c":
-                chat_id = resolve._tme_c_channel_id(cid)
-                entity = await client.get_entity(chat_id)
-            else:
-                entity = await client.get_entity(slug)
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123 or https://t.me/c/123456789/123")
+            return True
         if msg_id is None:
             await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/123")
             return True
@@ -704,23 +707,20 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
         if parsed["kind"] == "unknown":
             await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500 or https://t.me/c/123456789/500")
             return True
-        if parsed["kind"] == "username":
-            await event.respond("⚠️ Send a message link with a message ID, not just a username.")
-            return True
-        if parsed["kind"] == "channel_id":
-            await event.respond("⚠️ Send a message link with a message ID, not just an ID.")
-            return True
-        slug = parsed.get("slug")
-        cid = parsed.get("cid")
-        end_msg_id = parsed.get("msg_id")
-        if end_msg_id is None:
-            await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/500")
-            return True
-        if slug == "c":
-            end_chat_id = resolve._tme_c_channel_id(cid)
+        if parsed["kind"] == "message_link":
+            if parsed.get("slug") == "c":
+                end_entity = await resolve._resolve_private_channel(client, parsed["cid"])
+                if end_entity is None:
+                    await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
+                    return True
+                end_chat_id = end_entity.id
+            else:
+                end_entity = await client.get_entity(parsed["slug"])
+                end_chat_id = end_entity.id
+            end_msg_id = parsed.get("msg_id")
         else:
-            end_entity = await client.get_entity(slug)
-            end_chat_id = end_entity.id
+            await event.respond("⚠️ Send a message link with a message ID, not just a username or ID.")
+            return True
         if wiz.source["id"] != end_chat_id:
             await event.respond("⚠️ The end link must be from the same source chat as the start link.")
             return True

@@ -86,9 +86,9 @@ async def resolve(client: TelegramClient, text: str) -> Resolved | None:
             return _to_resolved(entity, "id")
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
-                # t.me/c/<cid>/<msg> -> private channel
-                chat_id = _tme_c_channel_id(parsed["cid"])
-                entity = await client.get_entity(chat_id)
+                entity = await _resolve_private_channel(client, parsed["cid"])
+                if entity is None:
+                    return None
                 resolved = _to_resolved(entity, "message_link")
                 resolved.msg_id = parsed.get("msg_id")
                 return resolved
@@ -121,11 +121,24 @@ async def resolve_forwarded(client: TelegramClient, message) -> Resolved | None:
         return None
 
 
-def _tme_c_channel_id(n: int) -> int:
-    """Convert the number in a t.me/c/<n>/<msg> link to the negative chat id."""
+def _tme_c_channel_id(n: int) -> list[int]:
+    """Convert the number in a t.me/c/<n>/<msg> link to possible negative chat ids."""
     if n > 1000000000000:
-        return -n
-    return int(f"-100{n}")
+        return [-n, int(f"-100{n}")]
+    return [int(f"-100{n}"), -n]
+
+
+async def _resolve_private_channel(client: TelegramClient, cid: int):
+    """Try multiple chat ID formats to resolve a private channel from t.me/c/ link."""
+    errors = []
+    for chat_id in _tme_c_channel_id(cid):
+        try:
+            return await client.get_entity(chat_id)
+        except (ChatIdInvalidError, ValueError, TypeError) as exc:
+            errors.append(f"{chat_id}: {exc}")
+            continue
+    log.warning("Failed to resolve private channel cid=%s with all formats: %s", cid, "; ".join(errors))
+    return None
 
 
 def _to_resolved(entity, input_type: str) -> Resolved:
