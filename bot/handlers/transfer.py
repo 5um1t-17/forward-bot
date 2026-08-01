@@ -653,7 +653,7 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         client = await client_pool.get(uid, sid)
         parsed = resolve.parse_input(event.raw_text)
         if parsed["kind"] == "unknown":
-            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123")
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123 or https://t.me/c/123456789/123")
             return True
         if parsed["kind"] == "username":
             entity = await client.get_entity(parsed["username"])
@@ -664,12 +664,12 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         else:
             slug = parsed.get("slug")
             cid = parsed.get("cid")
+            msg_id = parsed.get("msg_id")
             if slug == "c":
                 chat_id = resolve._tme_c_channel_id(cid)
                 entity = await client.get_entity(chat_id)
             else:
                 entity = await client.get_entity(slug)
-            msg_id = parsed.get("msg_id")
         if msg_id is None:
             await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/123")
             return True
@@ -684,16 +684,25 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         return True
     except Exception as exc:
         log.warning("link resolve error: %s", exc)
-        await event.respond(f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>", parse_mode="html")
+        await event.respond(
+            f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>\n\n"
+            f"Make sure the link format is correct and your account has access to the chat.",
+            parse_mode="html",
+        )
         return True
 
 
 async def _on_link_end_input(bot, event, uid: int) -> bool:
     wiz = store.get_transfer(uid)
+    sid = await db.get_active_sid(uid)
+    if not sid:
+        await event.respond(text.err_no_account())
+        return True
     try:
+        client = await client_pool.get(uid, sid)
         parsed = resolve.parse_input(event.raw_text)
         if parsed["kind"] == "unknown":
-            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500")
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500 or https://t.me/c/123456789/500")
             return True
         if parsed["kind"] == "username":
             await event.respond("⚠️ Send a message link with a message ID, not just a username.")
@@ -707,8 +716,16 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
         if end_msg_id is None:
             await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/500")
             return True
-        if wiz.source["id"] != (resolve._tme_c_channel_id(cid) if slug == "c" else (await client_pool.get(uid, await db.get_active_sid(uid))).get_entity(slug if slug != "c" else resolve._tme_c_channel_id(cid)).id):
+        if slug == "c":
+            end_chat_id = resolve._tme_c_channel_id(cid)
+        else:
+            end_entity = await client.get_entity(slug)
+            end_chat_id = end_entity.id
+        if wiz.source["id"] != end_chat_id:
             await event.respond("⚠️ The end link must be from the same source chat as the start link.")
+            return True
+        if end_msg_id < wiz.custom_start:
+            await event.respond("⚠️ End message ID must be greater than start message ID.")
             return True
         wiz.custom_end = end_msg_id
         wiz.count_mode = "custom"
@@ -722,7 +739,11 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
         return await _ask_mode(bot, event, uid)
     except Exception as exc:
         log.warning("end link resolve error: %s", exc)
-        await event.respond(f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>", parse_mode="html")
+        await event.respond(
+            f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>\n\n"
+            f"Make sure the link format is correct and your account has access to the chat.",
+            parse_mode="html",
+        )
         return True
 
 
