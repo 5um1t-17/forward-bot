@@ -95,6 +95,7 @@ def count_keyboard() -> list[list]:
          Button.inline("Latest 50", b"tr:count:50")],
         [Button.inline("Latest 100", b"tr:count:100"),
          Button.inline("Latest 500", b"tr:count:500")],
+        [Button.inline("🔗 From Message Link", b"tr:count:link")],
         [Button.inline("🔢 Custom Range", b"tr:count:custom")],
         [Button.inline("🔙 Back", b"menu")],
     ]
