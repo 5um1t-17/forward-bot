@@ -26,7 +26,8 @@ inline-keyboard admin interface.
 | **Media** | Photos, videos, documents, voice, audio, GIFs, stickers, polls, contacts, albums (albums stay albums), replies (best-effort remap). |
 | **Filters** | Everything, Photos, Videos, Documents, Text, Media. |
 | **Dedup** | "Skip already copied" — transferred IDs stored in `transferred_messages`, re-runs skip them. Reset anytime with `/cleanup`. |
-| **Speed** | No media download in Forward/Copy mode. `threads` concurrent workers drain an asyncio queue (Telegram limits respected). |
+| **Order** | **Strict source order in every mode** — messages are processed one at a time exactly as they appear in the source (text, image, video, gif... no mixing), so the destination mirrors the source. |
+| **Speed** | No media download in Forward/Copy mode. In **Download** mode `threads` downloads run in parallel while uploads are committed in strict source order (Telegram limits respected). |
 | **Progress** | Live progress bar edited in place: `████████░░░░░░`, done/total, elapsed, msg/sec, skipped, failed. **🔄 Refresh** and **🛑 Stop** buttons included. |
 | **Commands** | All core menus are available as Telegram commands next to the input box (`/transfer`, `/jobs`, `/settings`, `/stats`, `/cleanup`, ...) for fast access. |
 | **FloodWait** | `FloodWaitError` is detected, slept through and processing resumes automatically. |

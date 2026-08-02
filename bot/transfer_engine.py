@@ -2,16 +2,20 @@
 
 Strategy
 --------
-* Never downloads media. Forwarding uses ``forward_messages`` (native,
-  server-side). Copying recreates the message server-side via
-  ``send_file``/``send_message`` with the *existing* input media, so no
-  re-upload ever happens.
+* Never downloads media in Forward/Copy mode. Forwarding uses
+  ``forward_messages`` (native, server-side). Copying recreates the message
+  server-side via ``send_file``/``send_message`` with the *existing* input
+  media, so no re-upload ever happens.
+* **Strict ordering**: forward/copy/dedup items are processed one at a time in
+  source order, so the destination always mirrors the source exactly.
+* **Download & Re-upload** mode (for restricted private groups) uses an
+  order-preserving pipeline: up to ``threads`` downloads run in parallel while
+  uploads are committed strictly in source order.
 * Message ids are processed in ascending order so reply chains can be
   mapped from source id to destination id.
 * Albums (``grouped_id``) are re-grouped so they remain albums in the
   destination.
-* ``threads`` concurrent workers drain an asyncio queue; FloodWaitError is
-  slept through and processing resumes automatically.
+* FloodWaitError is slept through and processing resumes automatically.
 """
 from __future__ import annotations
 
@@ -199,7 +203,7 @@ class TransferEngine:
             return result
 
         reply_map: dict[int, int] = {}
-        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        ids = sorted(cfg.message_ids)
 
         async def _cancellable_sleep(seconds: float) -> bool:
             """Sleep in slices; return False if stop was requested meanwhile."""
@@ -210,44 +214,8 @@ class TransferEngine:
                 await asyncio.sleep(min(1.0, end - time.monotonic()))
             return True
 
-        async def _worker() -> None:
-            while True:
-                item = await queue.get()
-                try:
-                    if item is None:
-                        return
-                    if self._stop.is_set():
-                        continue  # drain remaining queue without processing
-                    try:
-                        await self._process_item(client, cfg, item, result, reply_map)
-                    except _Abort:
-                        return
-                    except Exception as exc:  # noqa: BLE001 - keep the queue alive
-                        log.warning("item failed: %s", exc)
-                        result.failed += item["count"]
-                    finally:
-                        if cfg.forward_delay and not self._stop.is_set():
-                            await _cancellable_sleep(cfg.forward_delay)
-                        if progress_cb is not None:
-                            elapsed = time.monotonic() - start
-                            speed = (result.success + result.skipped) / elapsed if elapsed else 0.0
-                            await progress_cb(
-                                {
-                                    "total": result.total,
-                                    "success": result.success,
-                                    "skipped": result.skipped,
-                                    "failed": result.failed,
-                                    "elapsed": elapsed,
-                                    "speed": speed,
-                                }
-                            )
-                finally:
-                    queue.task_done()
-
-        workers = [asyncio.create_task(_worker()) for _ in range(max(1, cfg.threads))]
-
+        aborted = False
         try:
-            ids = sorted(cfg.message_ids)
             for chunk_start in range(0, len(ids), config.BATCH_SIZE):
                 if self._stop.is_set():
                     break
@@ -257,12 +225,29 @@ class TransferEngine:
                 for item in items:
                     if self._stop.is_set():
                         break
-                    await queue.put(item)
-
-            # send one sentinel per worker, then wait for full drain
-            for _ in workers:
-                await queue.put(None)
-            await queue.join()
+                    try:
+                        await self._process_item(client, cfg, item, result, reply_map)
+                    except _Abort:
+                        aborted = True
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("item failed: %s", exc)
+                        result.failed += item["count"]
+                    if cfg.forward_delay and not self._stop.is_set():
+                        await _cancellable_sleep(cfg.forward_delay)
+                    if progress_cb is not None:
+                        elapsed = time.monotonic() - start
+                        speed = (result.success + result.skipped) / elapsed if elapsed else 0.0
+                        await progress_cb(
+                            {
+                                "total": result.total,
+                                "success": result.success,
+                                "skipped": result.skipped,
+                                "failed": result.failed,
+                                "elapsed": elapsed,
+                                "speed": speed,
+                            }
+                        )
         except asyncio.CancelledError:
             result.cancelled = True
             self._stop.set()
@@ -272,13 +257,15 @@ class TransferEngine:
             result.error = str(exc)
         finally:
             self._stop.set()
-            await asyncio.gather(*workers, return_exceptions=True)
 
         result.duration = time.monotonic() - start
         if self._cancelled:
             result.cancelled = True
             if not result.error:
                 result.error = "stopped by user"
+        elif aborted and not result.error:
+            result.cancelled = True
+            result.error = "stopped by user"
         elif result.cancelled and not result.error:
             result.error = "stopped by user"
         return result
@@ -955,7 +942,7 @@ def _mime_to_ext(mime: str) -> str:
 
 
 class _Abort(Exception):
-    """Internal: stop this worker because auto_resume is off / user stopped."""
+    """Internal: stop the current run because auto_resume is off / user stopped."""
 
 
 engine = TransferEngine()

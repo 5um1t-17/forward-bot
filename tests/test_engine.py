@@ -259,6 +259,30 @@ async def test_download_mixed_order():
     print("download mixed text/media order OK")
 
 
+async def test_forward_strict_order():
+    """Forward mode must land messages in the exact source order (no mixing),
+    including albums and interleaved text/media."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [
+        FakeMessage(1, text="t1"),
+        FakeMessage(2, types.MessageMediaPhoto(photo=None), grouped_id=77),
+        FakeMessage(3, types.MessageMediaPhoto(photo=None), grouped_id=77),
+        FakeMessage(4, text="t4"),
+        FakeMessage(5, types.MessageMediaPhoto(photo=None)),
+    ]
+    client = FakeClient(msgs)
+    eng = TransferEngine()
+
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2, 3, 4, 5],
+                         mode="forward", options={"keep_sender"}, threads=1, dedup=False, sid="abc")
+    res = await eng.run(client, cfg)
+    assert res.success == 5 and res.failed == 0, res
+    fwd_ids = [ids for op, ids, _ in client.sent if op == "forward"]
+    assert fwd_ids == [[1], [2, 3], [4], [5]], fwd_ids
+    print("forward strict order OK")
+
+
 async def test_download_ordered_pipeline():
     """Uploads must land in source order even when the first file is slow."""
     src = FakeEntity(1)
@@ -306,6 +330,7 @@ async def main():
     await test_run_copy_forward()
     await test_dedup_skip()
     await test_stop_no_hang()
+    await test_forward_strict_order()
     await test_download_ordered_pipeline()
     await test_download_mixed_order()
     await test_download_pipeline_stop()
