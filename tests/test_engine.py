@@ -226,6 +226,38 @@ class DownloadClient(FakeClient):
         self.sent.append(("dl_file", mid, kw))
         return FakeMessage(9000 + mid)
 
+    async def send_message(self, dest, text, **kw):
+        self.sent.append(("dl_text", text, kw))
+        try:
+            self.upload_order.append(int(str(text).strip()))
+        except ValueError:
+            self.upload_order.append(-1)
+        return FakeMessage(7000)
+
+
+async def test_download_mixed_order():
+    """A leading text message must be uploaded before the media that follows,
+    i.e. uploads land in the exact source order even across text/media."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [
+        FakeMessage(1, text="1"),   # text first
+        _media_msg(2),
+        _media_msg(3),
+        FakeMessage(4, text="4"),
+        _media_msg(5),
+    ]
+    delays = {2: 0.12, 3: 0.08, 5: 0.04}  # media slower, so unordered work would reorder
+    client = DownloadClient(msgs, delays)
+    eng = TransferEngine()
+
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2, 3, 4, 5],
+                         mode="download", threads=4, dedup=False, sid="abc")
+    res = await eng.run(client, cfg)
+    assert res.success == 5 and res.failed == 0, res
+    assert client.upload_order == [1, 2, 3, 4, 5], client.upload_order
+    print("download mixed text/media order OK")
+
 
 async def test_download_ordered_pipeline():
     """Uploads must land in source order even when the first file is slow."""
@@ -275,6 +307,7 @@ async def main():
     await test_dedup_skip()
     await test_stop_no_hang()
     await test_download_ordered_pipeline()
+    await test_download_mixed_order()
     await test_download_pipeline_stop()
     print("ALL TESTS PASSED")
 
