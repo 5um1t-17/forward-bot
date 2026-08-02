@@ -33,7 +33,22 @@ async def _route(bot, event, data: str) -> bool:
     if data.startswith("set:theme:"):
         return await _set(bot, event, uid, "dark_theme", data.split(":", 2)[2] == "on")
     if data == "set:delay":
-        return await _choice(bot, event, "delay", [("0", "0s (none)"), ("0.5", "0.5s"), ("1", "1s"), ("2", "2s")])
+        return await _choice(
+            bot,
+            event,
+            "delay",
+            [
+                ("0", "0s (none)"),
+                ("0.5", "0.5s"),
+                ("1", "1s"),
+                ("2", "2s"),
+                ("3", "3s"),
+                ("5", "5s"),
+                ("10", "10s"),
+                ("15", "15s"),
+                ("30", "30s"),
+            ],
+        )
     if data == "set:threads":
         return await _choice(bot, event, "threads", [("1", "1 thread"), ("2", "2 threads"), ("3", "3 threads"), ("4", "4 threads"), ("5", "5 threads"), ("8", "8 threads"), ("10", "10 threads")])
     if data == "set:retry":

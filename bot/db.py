@@ -19,6 +19,93 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from bot.config import config
 
+
+class InMemoryCollection:
+    def __init__(self) -> None:
+        self._docs: list[dict[str, Any]] = []
+
+    async def create_index(self, *args, **kwargs) -> None:
+        return None
+
+    async def insert_one(self, doc: dict[str, Any]) -> Any:
+        self._docs.append(doc)
+        return type("Result", (), {"inserted_id": len(self._docs) - 1})()
+
+    async def update_one(self, filter: dict[str, Any], update: dict[str, Any], upsert: bool = False) -> None:
+        for doc in self._docs:
+            if all(doc.get(k) == v for k, v in filter.items()):
+                if "$set" in update:
+                    doc.update(update["$set"])
+                if "$setOnInsert" in update:
+                    for key, value in update["$setOnInsert"].items():
+                        doc.setdefault(key, value)
+                return None
+
+        if not upsert:
+            return None
+
+        new_doc = dict(filter)
+        if "$setOnInsert" in update:
+            new_doc.update(update["$setOnInsert"])
+        if "$set" in update:
+            new_doc.update(update["$set"])
+        self._docs.append(new_doc)
+        return None
+
+    async def find_one(self, filter: dict[str, Any]) -> dict[str, Any] | None:
+        for doc in self._docs:
+            if all(doc.get(k) == v for k, v in filter.items()):
+                return doc
+        return None
+
+    async def delete_one(self, filter: dict[str, Any]) -> None:
+        self._docs = [doc for doc in self._docs if not all(doc.get(k) == v for k, v in filter.items())]
+
+    async def delete_many(self, filter: dict[str, Any]) -> Any:
+        deleted = [doc for doc in self._docs if all(doc.get(k) == v for k, v in filter.items())]
+        self._docs = [doc for doc in self._docs if not all(doc.get(k) == v for k, v in filter.items())]
+        return type("Result", (), {"deleted_count": len(deleted)})()
+
+    async def count_documents(self, filter: dict[str, Any]) -> int:
+        return sum(1 for doc in self._docs if all(doc.get(k) == v for k, v in filter.items()))
+
+    def find(self, filter: dict[str, Any]):
+        class Cursor:
+            def __init__(self, docs):
+                self._docs = docs
+
+            def sort(self, *args, **kwargs):
+                return self
+
+            def limit(self, *args, **kwargs):
+                return self
+
+            def __aiter__(self):
+                self._iter = iter(self._docs)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        return Cursor([doc for doc in self._docs if all(doc.get(k) == v for k, v in filter.items())])
+
+    async def aggregate(self, pipeline: list[dict[str, Any]]):
+        return []
+
+
+class InMemoryDatabase:
+    def __init__(self) -> None:
+        self.users = InMemoryCollection()
+        self.sessions = InMemoryCollection()
+        self.jobs = InMemoryCollection()
+        self.logs = InMemoryCollection()
+        self.settings = InMemoryCollection()
+        self.transferred = InMemoryCollection()
+
+
 log = logging.getLogger("bot.db")
 
 
@@ -40,15 +127,27 @@ class Database:
         self.transferred = None  # type: ignore[assignment]
 
     async def init(self) -> None:
-        self.client = AsyncIOMotorClient(self._uri, serverSelectionTimeoutMS=5000)
-        self.db = self.client[self._db_name]
-        self.users = self.db["users"]
-        self.sessions = self.db["sessions"]
-        self.jobs = self.db["jobs"]
-        self.logs = self.db["logs"]
-        self.settings = self.db["settings"]
-        self.transferred = self.db["transferred_messages"]
-        await self._ensure_indexes()
+        try:
+            self.client = AsyncIOMotorClient(self._uri, serverSelectionTimeoutMS=5000)
+            self.db = self.client[self._db_name]
+            self.users = self.db["users"]
+            self.sessions = self.db["sessions"]
+            self.jobs = self.db["jobs"]
+            self.logs = self.db["logs"]
+            self.settings = self.db["settings"]
+            self.transferred = self.db["transferred_messages"]
+            await self._ensure_indexes()
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            log.warning("MongoDB unavailable, falling back to in-memory store: %s", exc)
+            in_memory = InMemoryDatabase()
+            self.client = None
+            self.db = None
+            self.users = in_memory.users
+            self.sessions = in_memory.sessions
+            self.jobs = in_memory.jobs
+            self.logs = in_memory.logs
+            self.settings = in_memory.settings
+            self.transferred = in_memory.transferred
 
     async def _ensure_indexes(self) -> None:
         await self.users.create_index("user_id", unique=True)
