@@ -9,8 +9,10 @@ Strategy
 * **Strict ordering**: forward/copy/dedup items are processed one at a time in
   source order, so the destination always mirrors the source exactly.
 * **Download & Re-upload** mode (for restricted private groups) uses an
-  order-preserving pipeline: up to ``threads`` downloads run in parallel while
-  uploads are committed strictly in source order.
+  order-preserving high-speed pipeline: up to ``threads`` downloads run in
+  parallel, and file bytes are pre-uploaded in parallel too (``upload_file``),
+  while the final send is committed strictly in source order — so the heavy
+  transfer is fully pipelined yet the destination always mirrors the source.
 * Message ids are processed in ascending order so reply chains can be
   mapped from source id to destination id.
 * Albums (``grouped_id``) are re-grouped so they remain albums in the
@@ -322,8 +324,10 @@ class TransferEngine:
         reply_map: dict[int, int] = {}
         window = max(1, min(cfg.threads, config.MAX_THREADS))
         sem = asyncio.Semaphore(window)
+        up_sem = asyncio.Semaphore(window)
         ready: asyncio.Queue = asyncio.Queue()
         temp_paths: set[str] = set()
+        up_tasks: set[asyncio.Task] = set()
 
         async def downloader(idx: int, item: dict) -> None:
             msgs = item["messages"]
@@ -343,7 +347,14 @@ class TransferEngine:
                         client, cfg,
                         lambda: self._download_item(client, cfg, msgs, temp_paths),
                     )
-                await ready.put((idx, pkg, "ok"))
+                if pkg is not None:
+                    # hand off to a dedicated uploader task so the download
+                    # slot is freed and uploads overlap with further downloads
+                    task = asyncio.create_task(uploader(idx, pkg))
+                    up_tasks.add(task)
+                    task.add_done_callback(up_tasks.discard)
+                else:
+                    await ready.put((idx, None, "ok"))
             except _Abort:
                 await ready.put((idx, None, "abort"))
             except asyncio.CancelledError:
@@ -352,6 +363,29 @@ class TransferEngine:
             except Exception as exc:  # noqa: BLE001
                 log.warning("download failed for group starting msg %s: %s", msgs[0].id, exc)
                 result.failed += len(msgs)
+                await ready.put((idx, None, "failed"))
+
+        async def uploader(idx: int, pkg: dict) -> None:
+            # Upload file bytes in parallel (bounded). The actual send stays
+            # strictly ordered in the commit loop below.
+            try:
+                async with up_sem:
+                    if pkg["kind"] == "media":
+                        for payload in pkg["payloads"]:
+                            path = payload.get("path")
+                            if path and "file" not in payload:
+                                payload["file"] = await self._with_retries(
+                                    client, cfg, lambda p=path: client.upload_file(p)
+                                )
+                await ready.put((idx, pkg, "ok"))
+            except _Abort:
+                await ready.put((idx, None, "abort"))
+            except asyncio.CancelledError:
+                await ready.put((idx, None, "cancelled"))
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("file upload failed for group starting msg %s: %s", pkg["msgs"][0].id, exc)
+                result.failed += len(pkg["msgs"])
                 await ready.put((idx, None, "failed"))
 
         def cleanup_temp() -> None:
@@ -376,7 +410,7 @@ class TransferEngine:
                 try:
                     idx, pkg, status = await asyncio.wait_for(ready.get(), timeout=0.5)
                 except asyncio.TimeoutError:
-                    if all(t.done() for t in tasks) and ready.empty():
+                    if all(t.done() for t in tasks) and not up_tasks and ready.empty():
                         break
                     continue
                 pending[idx] = (pkg, status)
@@ -421,9 +455,9 @@ class TransferEngine:
                             }
                         )
         finally:
-            for task in tasks:
+            for task in list(tasks) + list(up_tasks):
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*(list(tasks) + list(up_tasks)), return_exceptions=True)
             cleanup_temp()
 
     async def _download_item(
@@ -523,9 +557,10 @@ class TransferEngine:
 
         media_payloads = [p for p in pkg["payloads"] if p["path"]]
         if len(media_payloads) > 1:
+            files = [p.get("file") or p["path"] for p in media_payloads]
             sent = await client.send_file(
                 cfg.dest_entity,
-                [p["path"] for p in media_payloads],
+                files,
                 caption=pkg["caption"],
                 silent=cfg.silent,
             )
@@ -556,7 +591,7 @@ class TransferEngine:
                 if payload["path"]:
                     sent = await client.send_file(
                         cfg.dest_entity,
-                        payload["path"],
+                        payload.get("file") or payload["path"],
                         caption=pkg["caption"],
                         formatting_entities=msg.entities,
                         parse_mode=None,

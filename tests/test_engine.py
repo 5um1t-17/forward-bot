@@ -198,16 +198,27 @@ def _media_msg(mid: int):
 
 
 class DownloadClient(FakeClient):
-    def __init__(self, messages, delays=None):
+    def __init__(self, messages, delays=None, upload_delays=None):
         super().__init__(messages)
         self.delays = delays or {}
+        self.upload_delays = upload_delays or {}
         self.upload_order = []
+        self.upload_ready_order = []
 
     async def download_media(self, msg, file=None):
         if self.delays.get(msg.id):
             await asyncio.sleep(self.delays[msg.id])
         with open(file, "w") as f:
             f.write(str(msg.id))
+        return file
+
+    async def upload_file(self, file):
+        with open(file) as f:
+            mid = int(f.read())
+        delay = self.upload_delays.get(mid)
+        if delay:
+            await asyncio.sleep(delay)
+        self.upload_ready_order.append(mid)
         return file
 
     async def send_file(self, dest, file, **kw):
@@ -303,6 +314,25 @@ async def test_download_ordered_pipeline():
     print("download ordered pipeline OK")
 
 
+async def test_download_upload_overlap():
+    """File uploads must run in parallel (item 1's slow upload finishes last)
+    while sends are still committed strictly in source order."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [_media_msg(i) for i in range(1, 9)]
+    client = DownloadClient(msgs, upload_delays={1: 0.3})
+    eng = TransferEngine()
+
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=list(range(1, 9)),
+                         mode="download", threads=4, dedup=False, sid="abc")
+    res = await eng.run(client, cfg)
+    assert res.success == 8 and res.failed == 0, res
+    assert client.upload_order == list(range(1, 9)), client.upload_order
+    assert client.upload_ready_order[0] != 1 or len(client.upload_ready_order) < 8
+    assert client.upload_ready_order[-1] == 1, client.upload_ready_order
+    print("download upload overlap OK")
+
+
 async def test_download_pipeline_stop():
     src = FakeEntity(1)
     dst = FakeEntity(2)
@@ -333,6 +363,7 @@ async def main():
     await test_forward_strict_order()
     await test_download_ordered_pipeline()
     await test_download_mixed_order()
+    await test_download_upload_overlap()
     await test_download_pipeline_stop()
     print("ALL TESTS PASSED")
 

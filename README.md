@@ -21,13 +21,13 @@ inline-keyboard admin interface.
 | **Destination** | Browse sendable groups/channels (paginated inline keyboard) or enter a link / username / ID manually. |
 | **Count** | Latest 10 / 50 / 100 / 500, or a custom inclusive message-ID range. |
 | **Mode** | **Forward** (native `forward_messages`, keeps original sender) or **Copy** (`send_file`/`send_message` with existing input media — forwarded tag removed, still no re-upload). |
-| **Download** | **Download & Re-upload** for restricted private groups: an order-preserving high-speed pipeline — several downloads run in parallel (window = `threads`) while uploads are committed strictly in source order, so the destination mirrors the source exactly no matter how file sizes differ. |
+| **Download** | **Download & Re-upload** for restricted private groups: an order-preserving high-speed pipeline — up to `threads` downloads and file uploads run in parallel (via `upload_file`) while the final send is committed strictly in source order, so the destination mirrors the source exactly no matter how file sizes differ. |
 | **Options** | Hide forward header, keep original sender, keep/remove captions, copy text only, copy media only. Invalid combinations are enforced automatically. |
 | **Media** | Photos, videos, documents, voice, audio, GIFs, stickers, polls, contacts, albums (albums stay albums), replies (best-effort remap). |
 | **Filters** | Everything, Photos, Videos, Documents, Text, Media. |
 | **Dedup** | "Skip already copied" — transferred IDs stored in `transferred_messages`, re-runs skip them. Reset anytime with `/cleanup`. |
 | **Order** | **Strict source order in every mode** — messages are processed one at a time exactly as they appear in the source (text, image, video, gif... no mixing), so the destination mirrors the source. |
-| **Speed** | No media download in Forward/Copy mode. In **Download** mode `threads` downloads run in parallel while uploads are committed in strict source order (Telegram limits respected). |
+| **Speed** | No media download in Forward/Copy mode. In **Download** mode `threads` downloads **and** file uploads run in parallel (file bytes are pre-uploaded with `upload_file`, so only the quick ordered send is serialized — Telegram limits respected). |
 | **Progress** | Live progress bar edited in place: `████████░░░░░░`, done/total, elapsed, msg/sec, skipped, failed. **🔄 Refresh** and **🛑 Stop** buttons included. |
 | **Commands** | All core menus are available as Telegram commands next to the input box (`/transfer`, `/jobs`, `/settings`, `/stats`, `/cleanup`, ...) for fast access. |
 | **FloodWait** | `FloodWaitError` is detected, slept through and processing resumes automatically. |
