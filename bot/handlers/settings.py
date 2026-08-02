@@ -35,7 +35,7 @@ async def _route(bot, event, data: str) -> bool:
     if data == "set:delay":
         return await _choice(bot, event, "delay", [("0", "0s (none)"), ("0.5", "0.5s"), ("1", "1s"), ("2", "2s")])
     if data == "set:threads":
-        return await _choice(bot, event, "threads", [("1", "1 thread"), ("2", "2 threads"), ("3", "3 threads"), ("5", "5 threads")])
+        return await _choice(bot, event, "threads", [("1", "1 thread"), ("2", "2 threads"), ("3", "3 threads"), ("4", "4 threads"), ("5", "5 threads"), ("8", "8 threads"), ("10", "10 threads")])
     if data == "set:retry":
         return await _choice(bot, event, "retry", [("3", "3 times"), ("5", "5 times"), ("0", "Unlimited")])
     if data == "set:flood":

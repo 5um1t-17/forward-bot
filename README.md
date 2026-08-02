@@ -21,12 +21,14 @@ inline-keyboard admin interface.
 | **Destination** | Browse sendable groups/channels (paginated inline keyboard) or enter a link / username / ID manually. |
 | **Count** | Latest 10 / 50 / 100 / 500, or a custom inclusive message-ID range. |
 | **Mode** | **Forward** (native `forward_messages`, keeps original sender) or **Copy** (`send_file`/`send_message` with existing input media — forwarded tag removed, still no re-upload). |
+| **Download** | **Download & Re-upload** for restricted private groups: an order-preserving high-speed pipeline — several downloads run in parallel (window = `threads`) while uploads are committed strictly in source order, so the destination mirrors the source exactly no matter how file sizes differ. |
 | **Options** | Hide forward header, keep original sender, keep/remove captions, copy text only, copy media only. Invalid combinations are enforced automatically. |
 | **Media** | Photos, videos, documents, voice, audio, GIFs, stickers, polls, contacts, albums (albums stay albums), replies (best-effort remap). |
 | **Filters** | Everything, Photos, Videos, Documents, Text, Media. |
-| **Dedup** | "Skip already copied" — transferred IDs stored in `transferred_messages`, re-runs skip them. |
-| **Speed** | No media download. `threads` concurrent workers drain an asyncio queue (Telegram limits respected). |
-| **Progress** | Live progress bar edited in place: `████████░░░░░░`, done/total, elapsed, msg/sec, skipped, failed. Stop button included. |
+| **Dedup** | "Skip already copied" — transferred IDs stored in `transferred_messages`, re-runs skip them. Reset anytime with `/cleanup`. |
+| **Speed** | No media download in Forward/Copy mode. `threads` concurrent workers drain an asyncio queue (Telegram limits respected). |
+| **Progress** | Live progress bar edited in place: `████████░░░░░░`, done/total, elapsed, msg/sec, skipped, failed. **🔄 Refresh** and **🛑 Stop** buttons included. |
+| **Commands** | All core menus are available as Telegram commands next to the input box (`/transfer`, `/jobs`, `/settings`, `/stats`, `/cleanup`, ...) for fast access. |
 | **FloodWait** | `FloodWaitError` is detected, slept through and processing resumes automatically. |
 | **Retry** | Auto-retry failed messages (3x / 5x / unlimited, per user setting). |
 | **Scheduling** | Run now, schedule later (one-off), daily, or weekly. |
@@ -145,9 +147,12 @@ python3 -m bot.main
    | 7. Dedup | skip already-copied messages |
    | 8. Schedule | run now / later / daily / weekly |
 
-3. Press **🚀 Start Transfer** and watch the live progress. Use **🛑 Stop**
-   to abort at any time.
+3. Press **🚀 Start Transfer** and watch the live progress. Use **🔄 Refresh**
+   to force an immediate progress update or **🛑 Stop** to abort at any time.
 4. Press **💾 Save as Job** to re-run the same transfer later from **📂 Saved Jobs**.
+5. Use the command menu next to the input box (or type `/transfer`, `/jobs`,
+   `/settings`, `/stats`) to jump straight into any section. Run `/cleanup` to
+   wipe the dedup records so every message is copied again.
 
 ---
 

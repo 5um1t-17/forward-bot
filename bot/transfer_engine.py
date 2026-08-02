@@ -172,6 +172,32 @@ class TransferEngine:
         self._cancelled = False
         result = TransferResult(total=len(cfg.message_ids))
         start = time.monotonic()
+
+        if cfg.mode == "download":
+            # Order-preserving high-speed path: several downloads run in
+            # parallel (window = threads) while uploads are committed strictly
+            # in source order, so the destination mirrors the source no matter
+            # how file sizes differ.
+            try:
+                await self._run_download_pipeline(client, cfg, result, progress_cb, start)
+            except asyncio.CancelledError:
+                result.cancelled = True
+                self._stop.set()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("download transfer aborted")
+                result.cancelled = True
+                result.error = str(exc)
+            finally:
+                self._stop.set()
+            result.duration = time.monotonic() - start
+            if self._cancelled:
+                result.cancelled = True
+                if not result.error:
+                    result.error = "stopped by user"
+            elif result.cancelled and not result.error:
+                result.error = "stopped by user"
+            return result
+
         reply_map: dict[int, int] = {}
         queue: asyncio.Queue = asyncio.Queue(maxsize=200)
 
@@ -284,6 +310,300 @@ class TransferEngine:
         items.extend(singles)
         items.sort(key=lambda it: it["messages"][0].id)
         return items
+
+    # ------------------------------------------------------------------
+    # Order-preserving high-speed download / re-upload pipeline.
+    #
+    # Downloads are dispatched up to ``cfg.threads`` at a time (so big files
+    # overlap with the upload of the previous message), while uploads are
+    # committed strictly in source order. The destination therefore mirrors
+    # the source exactly, regardless of individual file sizes.
+    # ------------------------------------------------------------------
+    async def _run_download_pipeline(
+        self, client, cfg: TransferConfig, result: TransferResult,
+        progress_cb: ProgressCb | None, start: float,
+    ) -> None:
+        ids = sorted(cfg.message_ids)
+        items: list[dict] = []
+        for chunk_start in range(0, len(ids), config.BATCH_SIZE):
+            if self._stop.is_set():
+                break
+            chunk = ids[chunk_start:chunk_start + config.BATCH_SIZE]
+            msgs = await self._fetch_existing(client, cfg.source_entity, chunk)
+            items.extend(self._build_items(msgs, cfg))
+
+        reply_map: dict[int, int] = {}
+        window = max(1, min(cfg.threads, config.MAX_THREADS))
+        sem = asyncio.Semaphore(window)
+        ready: asyncio.Queue = asyncio.Queue()
+        temp_paths: set[str] = set()
+
+        async def downloader(idx: int, item: dict) -> None:
+            msgs = item["messages"]
+            src_id, dst_id = cfg.source_entity.id, cfg.dest_entity.id
+            try:
+                async with sem:
+                    if self._stop.is_set():
+                        await ready.put((idx, None, "cancelled"))
+                        return
+                    if cfg.dedup:
+                        for m in msgs:
+                            if await db.is_transferred(src_id, dst_id, m.id):
+                                result.skipped += len(msgs)
+                                await ready.put((idx, None, "skipped"))
+                                return
+                    pkg = await self._with_retries(
+                        client, cfg,
+                        lambda: self._download_item(client, cfg, msgs, temp_paths),
+                    )
+                await ready.put((idx, pkg, "ok"))
+            except _Abort:
+                await ready.put((idx, None, "abort"))
+            except asyncio.CancelledError:
+                await ready.put((idx, None, "cancelled"))
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("download failed for group starting msg %s: %s", msgs[0].id, exc)
+                result.failed += len(msgs)
+                await ready.put((idx, None, "failed"))
+
+        def cleanup_temp() -> None:
+            for path in list(temp_paths):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            temp_paths.clear()
+
+        tasks = [asyncio.create_task(downloader(i, item)) for i, item in enumerate(items)]
+
+        next_seq = 0
+        pending: dict[int, tuple] = {}
+        remaining = len(items)
+        abort = False
+        try:
+            while remaining and not abort:
+                if self._stop.is_set():
+                    abort = True
+                    break
+                try:
+                    idx, pkg, status = await asyncio.wait_for(ready.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if all(t.done() for t in tasks) and ready.empty():
+                        break
+                    continue
+                pending[idx] = (pkg, status)
+                # commit in strict source order
+                while next_seq in pending:
+                    pkg, status = pending.pop(next_seq)
+                    next_seq += 1
+                    remaining -= 1
+                    if status == "ok" and pkg is not None and not self._stop.is_set():
+                        try:
+                            await self._with_retries(
+                                client, cfg,
+                                lambda: self._upload_item(client, cfg, pkg, reply_map),
+                            )
+                        except _Abort:
+                            abort = True
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("upload failed for group: %s", exc)
+                            result.failed += len(pkg["msgs"])
+                        else:
+                            sent = 0
+                            for m in pkg["msgs"]:
+                                if m.id in reply_map:
+                                    await db.mark_transferred(
+                                        cfg.source_entity.id, cfg.dest_entity.id,
+                                        m.id, cfg.sid, cfg.mode,
+                                    )
+                                    sent += 1
+                            result.success += sent
+                    if progress_cb is not None:
+                        elapsed = time.monotonic() - start
+                        speed = (result.success + result.skipped) / elapsed if elapsed else 0.0
+                        await progress_cb(
+                            {
+                                "total": result.total,
+                                "success": result.success,
+                                "skipped": result.skipped,
+                                "failed": result.failed,
+                                "elapsed": elapsed,
+                                "speed": speed,
+                            }
+                        )
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            cleanup_temp()
+
+    async def _download_item(
+        self, client, cfg: TransferConfig, msgs: list, temp_paths: set[str],
+    ) -> dict | None:
+        """Download an item (single message or album) to temp files.
+
+        Returns a package dict for :meth:`_upload_item`, or None if there is
+        nothing uploadable.
+        """
+        text_only = "text_only" in cfg.options
+        media_only = "media_only" in cfg.options
+        drop_caption = "remove_captions" in cfg.options
+
+        if text_only:
+            payloads = [{"msg": m, "path": None, "text": m.text} for m in msgs if m.text]
+            if not payloads:
+                return None
+            return {"msgs": msgs, "kind": "text", "payloads": payloads, "caption": ""}
+
+        caption = "" if (drop_caption or media_only) else (msgs[0].text or "")
+        media_msgs = [
+            m for m in msgs
+            if m.media and not isinstance(m.media, types.MessageMediaWebPage)
+        ]
+        text_msgs = [
+            m for m in msgs
+            if not (m.media and not isinstance(m.media, types.MessageMediaWebPage)) and m.text
+        ]
+
+        payloads: list[dict] = []
+        if len(media_msgs) > 1:
+            paths = await asyncio.gather(
+                *(self._download_one(client, m, temp_paths) for m in media_msgs)
+            )
+            for m, path in zip(media_msgs, paths):
+                if path:
+                    payloads.append({"msg": m, "path": path, "text": None})
+        else:
+            for m in media_msgs:
+                path = await self._download_one(client, m, temp_paths)
+                if path:
+                    payloads.append({"msg": m, "path": path, "text": None})
+        for m in text_msgs:
+            payloads.append({"msg": m, "path": None, "text": m.text})
+        if not payloads:
+            return None
+        return {"msgs": msgs, "kind": "media", "payloads": payloads, "caption": caption}
+
+    async def _download_one(self, client, msg, temp_paths: set[str]) -> str | None:
+        try:
+            ext = _media_extension(msg)
+            tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
+            temp_paths.add(tmp_path)
+            path = await client.download_media(msg, file=tmp_path)
+            if not path:
+                temp_paths.discard(tmp_path)
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                return None
+            return path
+        except FloodWaitError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("download failed for msg %s: %s", msg.id, exc)
+            temp_paths.discard(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return None
+
+    async def _upload_item(
+        self, client, cfg: TransferConfig, pkg: dict, reply_map: dict,
+    ) -> None:
+        # Temp files are only removed here on success. If an upload raises
+        # (e.g. FloodWait) the files are kept so _with_retries can retry, and
+        # any leftovers are cleaned up when the pipeline finishes.
+        if pkg["kind"] == "text":
+            for payload in pkg["payloads"]:
+                msg = payload["msg"]
+                reply_to = self._reply_to(msg, reply_map)
+                sent = await client.send_message(
+                    cfg.dest_entity,
+                    payload["text"],
+                    formatting_entities=msg.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                )
+                reply_map[msg.id] = sent.id
+            return
+
+        media_payloads = [p for p in pkg["payloads"] if p["path"]]
+        if len(media_payloads) > 1:
+            sent = await client.send_file(
+                cfg.dest_entity,
+                [p["path"] for p in media_payloads],
+                caption=pkg["caption"],
+                silent=cfg.silent,
+            )
+            if isinstance(sent, list) and len(sent) == len(media_payloads):
+                for payload, s in zip(media_payloads, sent):
+                    reply_map[payload["msg"].id] = s.id
+            else:
+                for payload in media_payloads:
+                    reply_map[payload["msg"].id] = sent.id
+            for payload in pkg["payloads"]:
+                if payload["path"] or not payload["text"]:
+                    continue
+                msg = payload["msg"]
+                reply_to = self._reply_to(msg, reply_map)
+                s = await client.send_message(
+                    cfg.dest_entity,
+                    payload["text"],
+                    formatting_entities=msg.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                )
+                reply_map[msg.id] = s.id
+        else:
+            for payload in pkg["payloads"]:
+                msg = payload["msg"]
+                reply_to = self._reply_to(msg, reply_map)
+                if payload["path"]:
+                    sent = await client.send_file(
+                        cfg.dest_entity,
+                        payload["path"],
+                        caption=pkg["caption"],
+                        formatting_entities=msg.entities,
+                        parse_mode=None,
+                        reply_to=reply_to,
+                        silent=cfg.silent,
+                    )
+                    reply_map[msg.id] = sent.id
+                elif payload["text"]:
+                    sent = await client.send_message(
+                        cfg.dest_entity,
+                        payload["text"],
+                        formatting_entities=msg.entities,
+                        parse_mode=None,
+                        reply_to=reply_to,
+                        silent=cfg.silent,
+                    )
+                    reply_map[msg.id] = sent.id
+        self._remove_temp_files(pkg)
+
+    @staticmethod
+    def _remove_temp_files(pkg: dict) -> None:
+        for payload in pkg["payloads"]:
+            path = payload.get("path")
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _reply_to(msg, reply_map: dict) -> int | None:
+        if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            return reply_map.get(msg.reply_to.reply_to_msg_id)
+        return None
 
     # ------------------------------------------------------------------
     async def _process_item(

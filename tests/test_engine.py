@@ -1,6 +1,7 @@
 """Standalone smoke tests (no live Telegram API needed)."""
 import asyncio
 import os
+import tempfile
 
 os.environ.setdefault("API_ID", "0")
 os.environ.setdefault("API_HASH", "x")
@@ -190,6 +191,82 @@ async def test_stop_no_hang():
     print(f"stop no-hang OK (processed {result.success} before stop)")
 
 
+def _media_msg(mid: int):
+    return FakeMessage(mid, types.MessageMediaDocument(
+        document=types.Document(id=mid, access_hash=1, file_reference=b"", date=None,
+                                mime_type="video/mp4", size=10, dc_id=1, attributes=[])))
+
+
+class DownloadClient(FakeClient):
+    def __init__(self, messages, delays=None):
+        super().__init__(messages)
+        self.delays = delays or {}
+        self.upload_order = []
+
+    async def download_media(self, msg, file=None):
+        if self.delays.get(msg.id):
+            await asyncio.sleep(self.delays[msg.id])
+        with open(file, "w") as f:
+            f.write(str(msg.id))
+        return file
+
+    async def send_file(self, dest, file, **kw):
+        if isinstance(file, list):
+            ids = []
+            for p in file:
+                with open(p) as f:
+                    ids.append(int(f.read()))
+                self.upload_order.append(ids[-1])
+            sent = [FakeMessage(8000 + i) for i in range(len(ids))]
+            self.sent.append(("dl_album", ids, kw))
+            return sent
+        with open(file) as f:
+            mid = int(f.read())
+        self.upload_order.append(mid)
+        self.sent.append(("dl_file", mid, kw))
+        return FakeMessage(9000 + mid)
+
+
+async def test_download_ordered_pipeline():
+    """Uploads must land in source order even when the first file is slow."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [_media_msg(i) for i in range(1, 11)]
+    delays = {1: 0.15, 2: 0.08, 3: 0.04}
+    client = DownloadClient(msgs, delays)
+    eng = TransferEngine()
+
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=list(range(1, 11)),
+                         mode="download", threads=4, dedup=False, sid="abc")
+    res = await eng.run(client, cfg)
+    assert res.success == 10 and res.failed == 0, res
+    assert client.upload_order == list(range(1, 11)), client.upload_order
+    assert len(os.listdir(tempfile.gettempdir())) >= 0  # temp files cleaned up
+    leftovers = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("fwd_")]
+    assert not leftovers, leftovers
+    print("download ordered pipeline OK")
+
+
+async def test_download_pipeline_stop():
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [_media_msg(i) for i in range(1, 60)]
+    client = DownloadClient(msgs, delays={i: 0.02 for i in range(1, 60)})
+    eng = TransferEngine()
+
+    async def stopper():
+        await asyncio.sleep(0.15)
+        eng.request_stop()
+
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=list(range(1, 60)),
+                         mode="download", threads=4, dedup=False, sid="abc")
+    stop_task = asyncio.create_task(stopper())
+    result = await asyncio.wait_for(eng.run(client, cfg), timeout=10)
+    await stop_task
+    assert result.cancelled, result
+    print(f"download pipeline stop OK (uploaded {len(client.upload_order)})")
+
+
 async def main():
     test_parse_input()
     test_filter()
@@ -197,6 +274,8 @@ async def main():
     await test_run_copy_forward()
     await test_dedup_skip()
     await test_stop_no_hang()
+    await test_download_ordered_pipeline()
+    await test_download_pipeline_stop()
     print("ALL TESTS PASSED")
 
 

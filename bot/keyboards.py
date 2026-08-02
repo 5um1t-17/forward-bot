@@ -203,7 +203,10 @@ def edit_keyboard() -> list[list]:
 
 
 def running_keyboard() -> list[list]:
-    return [[Button.inline("🛑 Stop", b"tr:run:stop")]]
+    return [
+        [Button.inline("🔄 Refresh", b"tr:run:refresh"),
+         Button.inline("🛑 Stop", b"tr:run:stop")],
+    ]
 
 
 def run_done_keyboard() -> list[list]:

@@ -10,12 +10,48 @@ from telethon import TelegramClient, events
 from bot import keyboards, text
 from bot.config import config
 from bot.db import db
-from bot.handlers import accounts, jobs, settings as settings_handler, start, stats, transfer
+from bot.handlers import accounts, commands, jobs, settings as settings_handler, start, stats, transfer
 from bot.logger import setup_logging
 from bot.scheduler import Scheduler
 from bot.state import store
 
 log = logging.getLogger("bot.main")
+
+
+_COMMANDS = {
+    "/transfer": commands.cmd_transfer,
+    "/accounts": commands.cmd_accounts,
+    "/jobs": commands.cmd_jobs,
+    "/settings": commands.cmd_settings,
+    "/stats": commands.cmd_stats,
+    "/cleanup": commands.cmd_cleanup,
+    "/help": None,  # handled inline
+}
+
+
+async def register_bot_commands(bot: TelegramClient) -> None:
+    """Expose commands in the Telegram menu button next to the input box."""
+    from telethon.tl import functions, types
+
+    entries = [
+        types.BotCommand("start", "Main menu"),
+        types.BotCommand("transfer", "Transfer messages"),
+        types.BotCommand("accounts", "Manage accounts"),
+        types.BotCommand("jobs", "Saved jobs"),
+        types.BotCommand("settings", "Settings"),
+        types.BotCommand("stats", "Statistics"),
+        types.BotCommand("cleanup", "Reset dedup records"),
+        types.BotCommand("cancel", "Abort current step"),
+    ]
+    try:
+        await bot(
+            functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopeDefault(), lang_code="", commands=entries
+            )
+        )
+        log.info("Registered %d bot commands", len(entries))
+    except Exception:  # noqa: BLE001
+        log.warning("Failed to register bot commands", exc_info=True)
 
 
 def register_handlers(bot: TelegramClient) -> None:
@@ -32,6 +68,21 @@ def register_handlers(bot: TelegramClient) -> None:
             getattr(event.sender, "username", "") or "",
         )
         raw = event.raw_text.strip() if event.raw_text else ""
+        low = raw.lower()
+        token = low.split(" ", 1)[0] if low else ""
+
+        if token in ("/cancel", "/stop") or low == "cancel":
+            await _cancel(bot, event, uid)
+            return
+        if token == "/start":
+            await start.cmd_start(bot, event)
+            return
+        if token == "/help":
+            await event.respond(text.commands_help(), parse_mode="html")
+            return
+        if token in _COMMANDS:
+            await _COMMANDS[token](bot, event, uid)
+            return
 
         pending = store.pending(uid)
         if pending:
@@ -41,12 +92,7 @@ def register_handlers(bot: TelegramClient) -> None:
                 return
             store.set_pending(uid, None)
 
-        low = raw.lower()
-        if low.startswith("/start"):
-            await start.cmd_start(bot, event)
-        elif low in ("/cancel", "/stop", "cancel"):
-            await _cancel(bot, event, uid)
-        elif event.message.forward is not None:
+        if event.message.forward is not None:
             # allow forwarded-message resolution even without a pending step
             await transfer.handle_pending(bot, event, "tr_source")
         elif raw:
@@ -84,6 +130,7 @@ async def _cancel(bot, event, uid: int) -> None:
     store.set_pending(uid, None)
     store.reset_transfer(uid)
     store.login.pop(uid, None)
+    store.progress.pop(uid, None)
     running = store.running.pop(uid, None)
     if running is not None:
         running.request_stop()
@@ -113,6 +160,8 @@ async def main() -> None:
     await bot.start(bot_token=config.BOT_TOKEN)
     me = await bot.get_me()
     log.info("Bot running as @%s", me.username)
+
+    await register_bot_commands(bot)
 
     register_handlers(bot)
 

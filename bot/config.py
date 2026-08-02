@@ -24,13 +24,13 @@ class Config:
     LOG_DIR: str = os.getenv("LOG_DIR", "logs")
     SESSION_DIR: str = os.getenv("SESSION_DIR", "sessions")
 
-    DEFAULT_THREADS: int = int(os.getenv("DEFAULT_THREADS", "2"))
+    DEFAULT_THREADS: int = int(os.getenv("DEFAULT_THREADS", "4"))
     DEFAULT_FORWARD_DELAY: float = float(os.getenv("DEFAULT_FORWARD_DELAY", "0"))
     SCHEDULER_INTERVAL: int = int(os.getenv("SCHEDULER_INTERVAL", "60"))
 
     # Hard caps for safety / Telegram limits
     MAX_CUSTOM_RANGE: int = int(os.getenv("MAX_CUSTOM_RANGE", "20000"))
-    MAX_THREADS: int = 5
+    MAX_THREADS: int = 10
     BATCH_SIZE: int = 100
 
     @property

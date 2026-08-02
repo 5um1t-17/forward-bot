@@ -47,6 +47,7 @@ class Store:
         self.transfer: dict[int, TransferWizard] = {}
         self.pending_input: dict[int, str] = {}   # uid -> expected input kind
         self.running: dict[int, object] = {}      # uid -> engine handle (for stop)
+        self.progress: dict[int, dict] = {}       # uid -> live progress snapshot (for refresh)
 
     def get_transfer(self, user_id: int) -> TransferWizard:
         if user_id not in self.transfer:

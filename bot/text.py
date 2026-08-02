@@ -429,6 +429,20 @@ def err_invalid_input() -> str:
     return "⚠️ Sorry, I didn't understand that. Please try again."
 
 
+def commands_help() -> str:
+    return (
+        "⌨️ <b>Fast-access commands</b>\n\n"
+        "/start — Main menu\n"
+        "/transfer — Start a transfer\n"
+        "/accounts — Manage accounts\n"
+        "/jobs — Saved jobs\n"
+        "/settings — Settings\n"
+        "/stats — Statistics\n"
+        "/cleanup — Reset dedup records\n"
+        "/cancel — Abort the current step"
+    )
+
+
 # ----------------------------------------------------------------------
 def _escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

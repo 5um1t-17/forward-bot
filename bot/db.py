@@ -264,6 +264,18 @@ class Database:
             # duplicate key -> already marked
             pass
 
+    async def clear_transferred(self, user_id: int) -> int:
+        """Delete the dedup records for a user's accounts.
+
+        Returns the number of records removed. Used by /cleanup so messages
+        are copied again on the next transfer.
+        """
+        sids = [d["sid"] for d in await self.get_user_sessions(user_id)]
+        if not sids:
+            return 0
+        res = await self.transferred.delete_many({"sid": {"$in": sids}})
+        return res.deleted_count
+
     async def transferred_count(self, user_id: int | None = None) -> int:
         q = {"sid": {"$in": [d["sid"] for d in await self.get_user_sessions(user_id)]}} if user_id else {}
         return await self.transferred.count_documents(q)

@@ -83,6 +83,8 @@ async def _route(bot, event, data: str) -> bool:
         return await _run(bot, event, uid)
     if data == "tr:run:stop":
         return await _stop(bot, event, uid)
+    if data == "tr:run:refresh":
+        return await _refresh(bot, event, uid)
     if data == "tr:run:savejob":
         return await _ask_job_name(bot, event, uid)
     if data == "tr:run:edit":
@@ -413,6 +415,42 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
     lock = asyncio.Lock()
     last_edit = {"t": 0.0}
 
+    async def refresh_now() -> None:
+        snap = store.progress.get(uid, {})
+        async with lock:
+            try:
+                await bot.edit_message(
+                    uid,
+                    progress_msg.id,
+                    text.progress_text(
+                        snap.get("success", 0) + snap.get("skipped", 0) + snap.get("failed", 0),
+                        snap.get("total", cfg.total_planned),
+                        snap.get("elapsed", 0.0),
+                        snap.get("speed", 0.0),
+                        snap.get("skipped", 0),
+                        snap.get("failed", 0),
+                        cfg.mode,
+                        settings["dark_theme"],
+                    ),
+                    buttons=keyboards.running_keyboard(),
+                    parse_mode="html",
+                )
+            except (MessageNotModifiedError, MessageIdInvalidError):
+                pass
+            except Exception:
+                log.debug("refresh edit failed", exc_info=True)
+
+    store.progress[uid] = {
+        "running": True,
+        "refresh": refresh_now,
+        "total": cfg.total_planned,
+        "success": 0,
+        "skipped": 0,
+        "failed": 0,
+        "elapsed": 0.0,
+        "speed": 0.0,
+    }
+
     log_id = await db.add_log(
         {
             "user_id": uid,
@@ -429,6 +467,18 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
 
     async def progress_cb(state: dict) -> None:
         elapsed = state["elapsed"]
+        snap = store.progress.get(uid)
+        if snap is not None:
+            snap.update(
+                {
+                    "total": state["total"],
+                    "success": state["success"],
+                    "skipped": state["skipped"],
+                    "failed": state["failed"],
+                    "elapsed": elapsed,
+                    "speed": state["speed"],
+                }
+            )
         if elapsed - last_edit["t"] < 0.8 and state["success"] + state["skipped"] + state["failed"] < state["total"]:
             return
         last_edit["t"] = elapsed
@@ -459,6 +509,7 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         result = await engine_obj.run(client=await client_pool.get(uid, cfg.sid), cfg=cfg, progress_cb=progress_cb)
     finally:
         store.running.pop(uid, None)
+        store.progress.pop(uid, None)
 
     if result.cancelled or result.error:
         final_text = text.run_failed(
@@ -498,6 +549,21 @@ async def _stop(bot, event, uid: int) -> bool:
         await answer(event, "Stopping after the current message...")
     else:
         await answer(event, "Nothing is running")
+    return True
+
+
+async def _refresh(bot, event, uid: int) -> bool:
+    """Force an immediate refresh of the live progress message."""
+    snap = store.progress.get(uid)
+    if not snap or not snap.get("running"):
+        await answer(event, "No active transfer to refresh", alert=True)
+        return True
+    refresh_fn = snap.get("refresh")
+    if refresh_fn is None:
+        await answer(event, "Nothing to refresh yet", alert=True)
+        return True
+    await refresh_fn()
+    await answer(event, "🔄 Progress refreshed")
     return True
 
 
