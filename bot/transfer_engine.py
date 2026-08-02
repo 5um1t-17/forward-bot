@@ -17,7 +17,9 @@ Strategy
   mapped from source id to destination id.
 * Albums (``grouped_id``) are re-grouped so they remain albums in the
   destination.
-* FloodWaitError is slept through and processing resumes automatically.
+* FloodWaitError is slept through and processing resumes automatically. If a
+  single operation keeps escalating its wait (cumulative > ``MAX_FLOOD_WAIT``)
+  it gives up and counts the item as failed instead of hanging forever.
 """
 from __future__ import annotations
 
@@ -412,6 +414,21 @@ class TransferEngine:
                 except asyncio.TimeoutError:
                     if all(t.done() for t in tasks) and not up_tasks and ready.empty():
                         break
+                    # keep the progress message alive while downloads/uploads
+                    # are still in flight, so the run never looks frozen
+                    if progress_cb is not None:
+                        elapsed = time.monotonic() - start
+                        speed = (result.success + result.skipped) / elapsed if elapsed else 0.0
+                        await progress_cb(
+                            {
+                                "total": result.total,
+                                "success": result.success,
+                                "skipped": result.skipped,
+                                "failed": result.failed,
+                                "elapsed": elapsed,
+                                "speed": speed,
+                            }
+                        )
                     continue
                 pending[idx] = (pkg, status)
                 # commit in strict source order
@@ -651,6 +668,7 @@ class TransferEngine:
 
     async def _with_retries(self, client, cfg, fn) -> None:
         attempts = 0
+        flood_total = 0.0
         while True:
             try:
                 return await fn()
@@ -658,8 +676,16 @@ class TransferEngine:
                 if not cfg.handle_flood:
                     raise
                 wait = exc.seconds
-                log.info("FloodWait %.1fs, sleeping", wait)
-                ok = await self._sleep_interruptible(min(wait, 300))
+                flood_total += wait
+                if flood_total > config.MAX_FLOOD_WAIT:
+                    log.warning(
+                        "flood wait keeps escalating (%.0fs total), giving up on this item",
+                        flood_total,
+                    )
+                    raise
+                sleep = min(wait, config.MAX_FLOOD_SLEEP) + config.FLOOD_BUFFER
+                log.info("FloodWait %.1fs, sleeping %.1fs", wait, sleep)
+                ok = await self._sleep_interruptible(sleep)
                 if not ok:
                     raise _Abort()
                 continue

@@ -33,6 +33,14 @@ class Config:
     MAX_THREADS: int = 10
     BATCH_SIZE: int = 100
 
+    # FloodWait handling: a single wait is slept through up to MAX_FLOOD_SLEEP
+    # seconds, but if the cumulative wait for one operation exceeds
+    # MAX_FLOOD_WAIT the operation gives up (counted as failed) instead of
+    # sleeping forever while Telegram keeps escalating the wait.
+    MAX_FLOOD_SLEEP: float = 300
+    MAX_FLOOD_WAIT: float = 600
+    FLOOD_BUFFER: float = 0.5
+
     @property
     def configured(self) -> bool:
         return bool(self.API_ID and self.API_HASH and self.BOT_TOKEN)

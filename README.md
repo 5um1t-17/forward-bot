@@ -30,7 +30,7 @@ inline-keyboard admin interface.
 | **Speed** | No media download in Forward/Copy mode. In **Download** mode `threads` downloads **and** file uploads run in parallel (file bytes are pre-uploaded with `upload_file`, so only the quick ordered send is serialized — Telegram limits respected). |
 | **Progress** | Live progress bar edited in place: `████████░░░░░░`, done/total, elapsed, msg/sec, skipped, failed. **🔄 Refresh** and **🛑 Stop** buttons included. |
 | **Commands** | All core menus are available as Telegram commands next to the input box (`/transfer`, `/jobs`, `/settings`, `/stats`, `/cleanup`, ...) for fast access. |
-| **FloodWait** | `FloodWaitError` is detected, slept through and processing resumes automatically. |
+| **FloodWait** | `FloodWaitError` is detected, slept through and processing resumes automatically. If Telegram keeps escalating a wait, the item gives up after a cumulative cap instead of hanging forever. |
 | **Retry** | Auto-retry failed messages (3x / 5x / unlimited, per user setting). |
 | **Scheduling** | Run now, schedule later (one-off), daily, or weekly. |
 | **Saved Jobs** | Save any transfer config and re-run it with one tap. |

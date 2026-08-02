@@ -8,6 +8,7 @@ os.environ.setdefault("API_HASH", "x")
 os.environ.setdefault("BOT_TOKEN", "x")
 
 from telethon.tl import types  # noqa: E402
+from telethon.errors import FloodWaitError  # noqa: E402
 
 from bot.entity_resolver import parse_input  # noqa: E402
 from bot.transfer_engine import TransferConfig, TransferEngine, message_matches_filter  # noqa: E402
@@ -353,6 +354,57 @@ async def test_download_pipeline_stop():
     print(f"download pipeline stop OK (uploaded {len(client.upload_order)})")
 
 
+async def test_download_flood_cap():
+    """Escalating FloodWait must never hang the run forever: once the
+    cumulative wait for an operation exceeds the cap, the item is counted as
+    failed and the pipeline moves on."""
+    import bot.config as bconfig
+    old_sleep, old_cap, old_buf = (
+        bconfig.config.MAX_FLOOD_SLEEP, bconfig.config.MAX_FLOOD_WAIT, bconfig.config.FLOOD_BUFFER,
+    )
+    bconfig.config.MAX_FLOOD_SLEEP, bconfig.config.MAX_FLOOD_WAIT, bconfig.config.FLOOD_BUFFER = 0.01, 0.05, 0.01
+    try:
+        src = FakeEntity(1)
+        dst = FakeEntity(2)
+        msgs = [_media_msg(i) for i in range(1, 4)]
+
+        class FloodClient(DownloadClient):
+            async def upload_file(self, file):
+                raise FloodWaitError(None, 5)
+
+        client = FloodClient(msgs)
+        eng = TransferEngine()
+        cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2, 3],
+                             mode="download", threads=2, dedup=False, sid="abc")
+        result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+        assert result.failed == 3 and result.success == 0, result
+        print("download flood cap OK")
+    finally:
+        bconfig.config.MAX_FLOOD_SLEEP, bconfig.config.MAX_FLOOD_WAIT, bconfig.config.FLOOD_BUFFER = (
+            old_sleep, old_cap, old_buf,
+        )
+
+
+async def test_download_progress_ticks():
+    """Progress must keep updating (not look frozen) while a slow download is
+    in flight."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [_media_msg(1), _media_msg(2)]
+    client = DownloadClient(msgs, delays={1: 1.2})
+    eng = TransferEngine()
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2],
+                         mode="download", threads=2, dedup=False, sid="abc")
+
+    ticks = []
+    async def progress_cb(state):
+        ticks.append(state["elapsed"])
+
+    await asyncio.wait_for(eng.run(client, cfg, progress_cb), timeout=15)
+    assert len(ticks) >= 3, ticks  # periodic ticks during the slow download
+    print("download progress ticks OK")
+
+
 async def main():
     test_parse_input()
     test_filter()
@@ -365,6 +417,8 @@ async def main():
     await test_download_mixed_order()
     await test_download_upload_overlap()
     await test_download_pipeline_stop()
+    await test_download_flood_cap()
+    await test_download_progress_ticks()
     print("ALL TESTS PASSED")
 
 
