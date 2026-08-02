@@ -84,6 +84,9 @@ class TransferResult:
 
 
 def message_matches_filter(msg, filter_type: str) -> bool:
+    # Defensive: ignore empty results from `get_messages` (can be None)
+    if msg is None:
+        return False
     if isinstance(msg, types.MessageService):
         return False
     if filter_type == "all":
@@ -180,6 +183,24 @@ class TransferEngine:
         self._cancelled = False
         result = TransferResult(total=len(cfg.message_ids))
         start = time.monotonic()
+        log.info(
+            "Starting transfer run: mode=%s total=%d forward_delay=%s threads=%s",
+            cfg.mode,
+            len(cfg.message_ids),
+            cfg.forward_delay,
+            cfg.threads,
+        )
+        if progress_cb is not None:
+            await progress_cb(
+                {
+                    "total": result.total,
+                    "success": result.success,
+                    "skipped": result.skipped,
+                    "failed": result.failed,
+                    "elapsed": 0.0,
+                    "speed": 0.0,
+                }
+            )
 
         if cfg.mode == "download":
             # Order-preserving high-speed path: several downloads run in
@@ -288,9 +309,13 @@ class TransferEngine:
         groups: dict[int, list] = {}
         singles: list[dict] = []
         for msg in msgs:
+            # skip None entries which can appear when messages are missing
+            if msg is None:
+                continue
             if not message_matches_filter(msg, cfg.filter_type):
                 continue
-            if msg.grouped_id:
+            # grouped_id may be falsy / None for non-album messages
+            if getattr(msg, "grouped_id", None):
                 groups.setdefault(msg.grouped_id, []).append(msg)
             else:
                 singles.append({"messages": [msg], "count": 1})
