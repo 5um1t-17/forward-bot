@@ -202,6 +202,8 @@ class Scheduler:
                         "failed": result.failed,
                     },
                     result.duration,
+                    result.success / result.duration if result.duration > 0 else 0.0,
+                    job.get("dest", {}).get("name", ""),
                 )
                 + f"\n\nJob: <b>{job.get('name', '')}</b>",
             )

@@ -108,7 +108,8 @@ async def main():
     assert await db.get_active_sid(1) == docs[0]["sid"]
     print("login flow OK; account persisted encrypted")
 
-    db.client.close()
+    if db.client is not None:
+        db.client.close()
     print("ACCOUNTS TESTS PASSED")
 
 

@@ -202,10 +202,21 @@ def edit_keyboard() -> list[list]:
     ]
 
 
-def running_keyboard() -> list[list]:
+def running_keyboard(paused: bool = False) -> list[list]:
+    if paused:
+        return [
+            [Button.inline("▶ Resume", b"tr:run:resume")],
+            [Button.inline("⏭ Skip Current", b"tr:run:skip"),
+             Button.inline("🔄 Refresh", b"tr:run:refresh")],
+            [Button.inline("🛑 Stop Transfer", b"tr:run:stop"),
+             Button.inline("📊 Statistics", b"tr:run:stats")],
+        ]
     return [
-        [Button.inline("🔄 Refresh", b"tr:run:refresh"),
-         Button.inline("🛑 Stop", b"tr:run:stop")],
+        [Button.inline("⏸ Pause", b"tr:run:pause")],
+        [Button.inline("⏭ Skip Current", b"tr:run:skip"),
+         Button.inline("🔄 Refresh", b"tr:run:refresh")],
+        [Button.inline("🛑 Stop Transfer", b"tr:run:stop"),
+         Button.inline("📊 Statistics", b"tr:run:stats")],
     ]
 
 

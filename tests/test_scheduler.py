@@ -129,7 +129,7 @@ async def main():
     assert len(logs) >= 1
     assert logs[0]["status"] == "done" and logs[0]["success"] == 10, logs[0]
 
-    notified = [t for _, t in scheduler.bot.sent if "Transfer complete" in t]
+    notified = [t for _, t in scheduler.bot.sent if "Transfer Complete" in t]
     assert notified, "expected completion notification"
     print("scheduler execute_job OK; notification sent")
 
@@ -139,7 +139,8 @@ async def main():
     assert _compute_next("weekly", "09:00", 1, base).weekday() == 1  # next Monday
     print("schedule date logic OK")
 
-    db.client.close()
+    if db.client is not None:
+        db.client.close()
     print("SCHEDULER TESTS PASSED")
 
 

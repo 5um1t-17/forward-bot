@@ -214,7 +214,7 @@ async def main():
     edits = [s for s in bot.sent if s[0] == "edit"]
     assert edits, "expected final edit"
     final = edits[-1][3]
-    assert "Transfer complete" in final or "interrupted" in final, final
+    assert "Transfer Complete" in final or "interrupted" in final, final
 
     # save as job
     ev = FakeEvent(1, data="tr:run:savejob")
@@ -236,7 +236,8 @@ async def main():
     ok = await jobs_handler.handle(bot, ev, f"jobs:run:{jid}")
     assert ok
 
-    db.client.close()
+    if db.client is not None:
+        db.client.close()
     print("INTEGRATION TESTS PASSED")
 
 

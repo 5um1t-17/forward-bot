@@ -33,6 +33,17 @@ class Config:
     MAX_THREADS: int = 10
     BATCH_SIZE: int = 100
 
+    # Download & Re-upload speed: parallel transfers are multiplied past the
+    # user's `threads` setting. Downloads and uploads use independent pools so
+    # big files overlap as much as Telegram's limits allow.
+    DOWNLOAD_MULT: int = int(os.getenv("DOWNLOAD_MULT", "2"))
+    UPLOAD_MULT: int = int(os.getenv("UPLOAD_MULT", "2"))
+    MAX_DL_THREADS: int = int(os.getenv("MAX_DL_THREADS", "6"))
+    MAX_UP_THREADS: int = int(os.getenv("MAX_UP_THREADS", "6"))
+
+    # How often the live progress message is refreshed (seconds).
+    PROGRESS_REFRESH: float = float(os.getenv("PROGRESS_REFRESH", "2"))
+
     # FloodWait handling: a single wait is slept through up to MAX_FLOOD_SLEEP
     # seconds, but if the cumulative wait for one operation exceeds
     # MAX_FLOOD_WAIT the operation gives up (counted as failed) instead of

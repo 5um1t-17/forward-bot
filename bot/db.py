@@ -24,16 +24,37 @@ class InMemoryCollection:
     def __init__(self) -> None:
         self._docs: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _matches(doc: dict[str, Any], filter: dict[str, Any]) -> bool:
+        from bson import ObjectId
+
+        for k, v in filter.items():
+            if k == "$in":
+                values = v
+                if doc.get("_id") in values or str(doc.get("_id")) in [str(x) for x in values]:
+                    continue
+                return False
+            stored = doc.get(k)
+            if isinstance(v, ObjectId) or isinstance(stored, ObjectId):
+                if str(stored) != str(v):
+                    return False
+            elif stored != v:
+                return False
+        return True
+
     async def create_index(self, *args, **kwargs) -> None:
         return None
 
     async def insert_one(self, doc: dict[str, Any]) -> Any:
+        # mimic a real MongoDB ObjectId so str(inserted_id) is ObjectId-parseable
+        inserted_id = secrets.token_hex(12)
+        doc.setdefault("_id", inserted_id)
         self._docs.append(doc)
-        return type("Result", (), {"inserted_id": len(self._docs) - 1})()
+        return type("Result", (), {"inserted_id": inserted_id})()
 
     async def update_one(self, filter: dict[str, Any], update: dict[str, Any], upsert: bool = False) -> None:
         for doc in self._docs:
-            if all(doc.get(k) == v for k, v in filter.items()):
+            if self._matches(doc, filter):
                 if "$set" in update:
                     doc.update(update["$set"])
                 if "$setOnInsert" in update:
@@ -49,25 +70,25 @@ class InMemoryCollection:
             new_doc.update(update["$setOnInsert"])
         if "$set" in update:
             new_doc.update(update["$set"])
-        self._docs.append(new_doc)
+        await self.insert_one(new_doc)
         return None
 
     async def find_one(self, filter: dict[str, Any]) -> dict[str, Any] | None:
         for doc in self._docs:
-            if all(doc.get(k) == v for k, v in filter.items()):
+            if self._matches(doc, filter):
                 return doc
         return None
 
     async def delete_one(self, filter: dict[str, Any]) -> None:
-        self._docs = [doc for doc in self._docs if not all(doc.get(k) == v for k, v in filter.items())]
+        self._docs = [doc for doc in self._docs if not self._matches(doc, filter)]
 
     async def delete_many(self, filter: dict[str, Any]) -> Any:
-        deleted = [doc for doc in self._docs if all(doc.get(k) == v for k, v in filter.items())]
-        self._docs = [doc for doc in self._docs if not all(doc.get(k) == v for k, v in filter.items())]
+        deleted = [doc for doc in self._docs if self._matches(doc, filter)]
+        self._docs = [doc for doc in self._docs if not self._matches(doc, filter)]
         return type("Result", (), {"deleted_count": len(deleted)})()
 
     async def count_documents(self, filter: dict[str, Any]) -> int:
-        return sum(1 for doc in self._docs if all(doc.get(k) == v for k, v in filter.items()))
+        return sum(1 for doc in self._docs if self._matches(doc, filter))
 
     def find(self, filter: dict[str, Any]):
         class Cursor:
@@ -90,7 +111,7 @@ class InMemoryCollection:
                 except StopIteration:
                     raise StopAsyncIteration
 
-        return Cursor([doc for doc in self._docs if all(doc.get(k) == v for k, v in filter.items())])
+        return Cursor([doc for doc in self._docs if self._matches(doc, filter)])
 
     async def aggregate(self, pipeline: list[dict[str, Any]]):
         return []

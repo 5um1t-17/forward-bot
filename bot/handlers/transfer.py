@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from telethon import events
 from telethon.errors import MessageNotModifiedError, MessageIdInvalidError
 
 from bot import keyboards, text
 from bot.client_pool import client_pool
+from bot.config import config
 from bot.db import db, now
 from bot.entity_resolver import fetch_sendable_dialogs, parse_input, resolve, resolve_forwarded, _resolve_private_channel
 from bot.handlers.common import answer, edit
@@ -83,6 +85,14 @@ async def _route(bot, event, data: str) -> bool:
         return await _run(bot, event, uid)
     if data == "tr:run:stop":
         return await _stop(bot, event, uid)
+    if data == "tr:run:pause":
+        return await _pause(bot, event, uid)
+    if data == "tr:run:resume":
+        return await _resume(bot, event, uid)
+    if data == "tr:run:skip":
+        return await _skip(bot, event, uid)
+    if data == "tr:run:stats":
+        return await _stats(bot, event, uid)
     if data == "tr:run:refresh":
         return await _refresh(bot, event, uid)
     if data == "tr:run:savejob":
@@ -402,54 +412,100 @@ async def _run(bot, event, uid: int) -> bool:
 
 
 async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
-    """Shared runner used by the wizard and saved jobs."""
+    """Shared runner used by the wizard and saved jobs.
+
+    One progress message is edited in place by a background updater. The
+    engine pushes a rich snapshot (current message, file bytes, operation,
+    FloodWait countdown) which is rendered every ``PROGRESS_REFRESH`` seconds
+    and immediately after a message completes or is skipped.
+    """
     settings = await db.get_settings(uid)
-    progress_msg = await bot.send_message(
-        uid,
-        text.progress_text(0, cfg.total_planned, 0, 0, 0, 0, cfg.mode, settings["dark_theme"]),
-        buttons=keyboards.running_keyboard(),
-        parse_mode="html",
-    )
-    engine_obj = TransferEngine()
-    store.running[uid] = engine_obj
-    lock = asyncio.Lock()
-    last_edit = {"t": 0.0}
-
-    async def refresh_now() -> None:
-        snap = store.progress.get(uid, {})
-        async with lock:
-            try:
-                await bot.edit_message(
-                    uid,
-                    progress_msg.id,
-                    text.progress_text(
-                        snap.get("success", 0) + snap.get("skipped", 0) + snap.get("failed", 0),
-                        snap.get("total", cfg.total_planned),
-                        snap.get("elapsed", 0.0),
-                        snap.get("speed", 0.0),
-                        snap.get("skipped", 0),
-                        snap.get("failed", 0),
-                        cfg.mode,
-                        settings["dark_theme"],
-                    ),
-                    buttons=keyboards.running_keyboard(),
-                    parse_mode="html",
-                )
-            except (MessageNotModifiedError, MessageIdInvalidError):
-                pass
-            except Exception:
-                log.debug("refresh edit failed", exc_info=True)
-
-    store.progress[uid] = {
-        "running": True,
-        "refresh": refresh_now,
+    init_state = {
         "total": cfg.total_planned,
         "success": 0,
         "skipped": 0,
         "failed": 0,
         "elapsed": 0.0,
         "speed": 0.0,
+        "eta": 0.0,
+        "mode": cfg.mode,
+        "operation": "Resolving Link",
+        "paused": False,
+        "flood_wait": None,
+        "current": None,
+        "file": None,
+        "source_name": cfg.source_name,
+        "dest_name": cfg.dest_name,
     }
+    progress_msg = await bot.send_message(
+        uid,
+        text.progress_text(init_state),
+        buttons=keyboards.running_keyboard(False),
+        parse_mode="html",
+    )
+    engine_obj = TransferEngine()
+    store.running[uid] = engine_obj
+    snap = {
+        "running": True,
+        "engine": engine_obj,
+        "cfg": cfg,
+        "settings": settings,
+        "progress_msg_id": progress_msg.id,
+        "last_edit": 0.0,
+        "edit_lock": asyncio.Lock(),
+        "_done": 0,
+    }
+    store.progress[uid] = snap
+
+    async def render(force: bool = False) -> None:
+        current = store.progress.get(uid)
+        if current is None or not current.get("running"):
+            return
+        async with current["edit_lock"]:
+            now_t = time.monotonic()
+            if not force and now_t - current["last_edit"] < config.PROGRESS_REFRESH:
+                return
+            current["last_edit"] = now_t
+            try:
+                await bot.edit_message(
+                    uid,
+                    current["progress_msg_id"],
+                    text.progress_text(current),
+                    buttons=keyboards.running_keyboard(bool(current.get("paused"))),
+                    parse_mode="html",
+                )
+            except (MessageNotModifiedError, MessageIdInvalidError):
+                pass
+            except Exception:
+                log.debug("progress edit failed", exc_info=True)
+
+    snap["render"] = render
+
+    async def updater() -> None:
+        while store.progress.get(uid, {}).get("running"):
+            await asyncio.sleep(config.PROGRESS_REFRESH)
+            try:
+                await render()
+            except Exception:
+                log.debug("updater render failed", exc_info=True)
+
+    update_task = asyncio.create_task(updater())
+
+    async def progress_cb(state: dict) -> None:
+        current = store.progress.get(uid)
+        if current is None:
+            return
+        done = state.get("success", 0) + state.get("skipped", 0) + state.get("failed", 0)
+        changed = done != current.get("_done", 0)
+        current.update({k: v for k, v in state.items() if k != "render"})
+        current["_done"] = done
+        # immediate refresh after a message completes / is skipped, or a 2s
+        # cadence while a single file is being transferred
+        if changed or state.get("paused"):
+            try:
+                await render(force=time.monotonic() - current.get("last_edit", 0.0) >= 0.5)
+            except Exception:
+                log.debug("immediate render failed", exc_info=True)
 
     log_id = await db.add_log(
         {
@@ -465,62 +521,31 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         }
     )
 
-    async def progress_cb(state: dict) -> None:
-        elapsed = state["elapsed"]
-        snap = store.progress.get(uid)
-        if snap is not None:
-            snap.update(
-                {
-                    "total": state["total"],
-                    "success": state["success"],
-                    "skipped": state["skipped"],
-                    "failed": state["failed"],
-                    "elapsed": elapsed,
-                    "speed": state["speed"],
-                }
-            )
-        if elapsed - last_edit["t"] < 0.8 and state["success"] + state["skipped"] + state["failed"] < state["total"]:
-            return
-        last_edit["t"] = elapsed
-        async with lock:
-            try:
-                await bot.edit_message(
-                    uid,
-                    progress_msg.id,
-                    text.progress_text(
-                        state["success"] + state["skipped"] + state["failed"],
-                        state["total"],
-                        state["elapsed"],
-                        state["speed"],
-                        state["skipped"],
-                        state["failed"],
-                        cfg.mode,
-                        settings["dark_theme"],
-                    ),
-                    buttons=keyboards.running_keyboard(),
-                    parse_mode="html",
-                )
-            except (MessageNotModifiedError, MessageIdInvalidError):
-                pass
-            except Exception:
-                log.debug("progress edit failed", exc_info=True)
-
     try:
         result = await engine_obj.run(client=await client_pool.get(uid, cfg.sid), cfg=cfg, progress_cb=progress_cb)
     finally:
         store.running.pop(uid, None)
+        update_task.cancel()
+        try:
+            await update_task
+        except (asyncio.CancelledError, Exception):
+            pass
         store.progress.pop(uid, None)
 
+    avg_speed = result.success / result.duration if result.duration > 0 else 0.0
     if result.cancelled or result.error:
         final_text = text.run_failed(
             {"total": result.total, "success": result.success, "skipped": result.skipped, "failed": result.failed},
             result.duration,
             result.error,
+            cfg.dest_name,
         )
     else:
         final_text = text.run_done(
             {"total": result.total, "success": result.success, "skipped": result.skipped, "failed": result.failed},
             result.duration,
+            avg_speed,
+            cfg.dest_name,
         )
     try:
         await bot.edit_message(uid, progress_msg.id, final_text, buttons=keyboards.run_done_keyboard(), parse_mode="html")
@@ -552,17 +577,103 @@ async def _stop(bot, event, uid: int) -> bool:
     return True
 
 
+async def _pause(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await answer(event, "Nothing is running", alert=True)
+        return True
+    engine_obj.request_pause()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["paused"] = True
+        snap["operation"] = "Paused"
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            pass
+    await answer(event, "⏸ Paused — press Resume to continue")
+    return True
+
+
+async def _resume(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await answer(event, "Nothing is running", alert=True)
+        return True
+    engine_obj.request_resume()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["paused"] = False
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            pass
+    await answer(event, "▶ Resumed")
+    return True
+
+
+async def _skip(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await answer(event, "Nothing is running", alert=True)
+        return True
+    engine_obj.request_skip()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["operation"] = "Skipping"
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            pass
+    await answer(event, "⏭ Skipping current message...")
+    return True
+
+
+async def cmd_skip(bot, event, uid: int) -> bool:
+    """Handle the /skip text command during a running transfer."""
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await event.respond("Nothing is currently running.")
+        return True
+    engine_obj.request_skip()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["operation"] = "Skipping"
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            pass
+    await event.respond("⏭ Skipping current message...")
+    return True
+
+
+async def _stats(bot, event, uid: int) -> bool:
+    snap = store.progress.get(uid)
+    if not snap or not snap.get("running"):
+        await answer(event, "No active transfer", alert=True)
+        return True
+    try:
+        await snap["render"](force=True)
+    except Exception:
+        pass
+    await answer(
+        event,
+        f"✅ {snap.get('success', 0)}  ❌ {snap.get('failed', 0)}  "
+        f"⏭ {snap.get('skipped', 0)} · {snap.get('speed', 0.0):.1f} msg/s",
+    )
+    return True
+
+
 async def _refresh(bot, event, uid: int) -> bool:
     """Force an immediate refresh of the live progress message."""
     snap = store.progress.get(uid)
     if not snap or not snap.get("running"):
         await answer(event, "No active transfer to refresh", alert=True)
         return True
-    refresh_fn = snap.get("refresh")
-    if refresh_fn is None:
-        await answer(event, "Nothing to refresh yet", alert=True)
-        return True
-    await refresh_fn()
+    try:
+        await snap["render"](force=True)
+    except Exception:
+        pass
     await answer(event, "🔄 Progress refreshed")
     return True
 

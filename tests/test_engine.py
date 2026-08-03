@@ -206,14 +206,14 @@ class DownloadClient(FakeClient):
         self.upload_order = []
         self.upload_ready_order = []
 
-    async def download_media(self, msg, file=None):
+    async def download_media(self, msg, file=None, progress_callback=None):
         if self.delays.get(msg.id):
             await asyncio.sleep(self.delays[msg.id])
         with open(file, "w") as f:
             f.write(str(msg.id))
         return file
 
-    async def upload_file(self, file):
+    async def upload_file(self, file, progress_callback=None):
         with open(file) as f:
             mid = int(f.read())
         delay = self.upload_delays.get(mid)
@@ -369,7 +369,7 @@ async def test_download_flood_cap():
         msgs = [_media_msg(i) for i in range(1, 4)]
 
         class FloodClient(DownloadClient):
-            async def upload_file(self, file):
+            async def upload_file(self, file, progress_callback=None):
                 raise FloodWaitError(None, 5)
 
         client = FloodClient(msgs)

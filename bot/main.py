@@ -74,6 +74,9 @@ def register_handlers(bot: TelegramClient) -> None:
         if token in ("/cancel", "/stop") or low == "cancel":
             await _cancel(bot, event, uid)
             return
+        if token == "/skip":
+            await transfer.cmd_skip(bot, event, uid)
+            return
         if token == "/start":
             await start.cmd_start(bot, event)
             return

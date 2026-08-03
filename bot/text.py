@@ -284,51 +284,243 @@ def _bar(fraction: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def progress_text(done: int, total: int, elapsed: float, speed: float,
-                  skipped: int, failed: int, mode: str, dark: bool = False) -> str:
-    fraction = done / total if total else 0.0
-    if mode == "forward":
-        verb = "Forwarding"
-    elif mode == "download":
-        verb = "Downloading"
-    else:
-        verb = "Copying"
-    icon = "🌙" if dark else "☀️"
-    lines = [
-        f"{icon} <b>{verb}...</b>",
-        "",
-        f"<code>{_bar(fraction)}</code>",
-        f"<b>{fraction * 100:.1f}%</b>",
-        f"<b>{done}</b> / {total}",
-        "",
-        f"Elapsed: <code>{_fmt_elapsed(elapsed)}</code>",
-        f"Speed: <code>{speed:.1f}</code> msg/sec",
-        f"Skipped: <code>{skipped}</code>",
-        f"Failed: <code>{failed}</code>",
+def _bar2(fraction: float, width: int = 10) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _op_icon(operation: str, paused: bool) -> str:
+    if paused:
+        return "⏸"
+    op = (operation or "").lower()
+    for key, icon in (
+        ("download", "📥"),
+        ("upload", "📤"),
+        ("forward", "➡️"),
+        ("copy", "📑"),
+        ("compres", "🗜"),
+        ("resolv", "🔍"),
+        ("flood", "⏳"),
+        ("wait", "⏳"),
+        ("skip", "⏭"),
+        ("pause", "⏸"),
+    ):
+        if key in op:
+            return icon
+    return "⚙️"
+
+
+def _fmt_size(n: int | float) -> str:
+    n = float(n or 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    u = 0
+    while n >= 1024 and u < len(units) - 1:
+        n /= 1024
+        u += 1
+    if u == 0:
+        return f"{int(n)} {units[u]}"
+    return f"{n:.1f} {units[u]}"
+
+
+def _fmt_bps(n: float) -> str:
+    return f"{_fmt_size(n)}/s"
+
+
+_SEP = "━━━━━━━━━━━━━━━━━━━━"
+
+
+def progress_text(state: dict) -> str:
+    """Render the live, in-place-edited progress message.
+
+    The engine pushes a rich snapshot: current message info, per-file byte
+    progress, operation, FloodWait countdown, stats and source/destination.
+    """
+    mode = state.get("mode", "copy")
+    operation = state.get("operation") or _verb(mode)
+    paused = bool(state.get("paused", False))
+    success = state.get("success", 0)
+    skipped = state.get("skipped", 0)
+    failed = state.get("failed", 0)
+    total = state.get("total", 0)
+    done = success + skipped + failed
+    elapsed = state.get("elapsed", 0.0)
+    speed = state.get("speed", 0.0)          # messages / sec
+    eta = state.get("eta", 0.0)              # overall remaining seconds
+    current = state.get("current")
+    file = state.get("file")
+    flood = state.get("flood_wait")
+    source = state.get("source_name") or "Source"
+    dest = state.get("dest_name") or "Destination"
+    current_link = (current or {}).get("link")
+
+    lines: list[str] = [
+        f"{_op_icon(operation, paused)} <b>{_escape(operation)}</b>",
     ]
+    if paused:
+        lines.append("<i>⏸ Transfer paused — press Resume to continue.</i>")
+    lines.append("")
+    lines.append(_SEP)
+
+    # 1. current message
+    lines.append("📥 <b>Current Message</b>")
+    lines.append("")
+    if current:
+        link = current.get("link") or ""
+        if link:
+            lines.append(f"🔗 <code>{_escape(link)}</code>")
+        lines.append(f"Message ID: <code>{current.get('msg_id')}</code>")
+        lines.append(f"Type: <b>{_escape(current.get('type') or 'Message')}</b>")
+        size = current.get("size") or 0
+        if size:
+            lines.append(f"Size: <code>{_fmt_size(size)}</code>")
+    else:
+        lines.append("<i>Preparing…</i>")
+    lines.append("")
+    lines.append("⏭ If this message is taking too long:")
+    lines.append("<code>/skip</code>")
+    lines.append("")
+    lines.append(_SEP)
+
+    # 2. overall progress bar
+    lines.append("🚀 <b>Overall Transfer</b>")
+    lines.append("")
+    fraction = done / total if total else 0.0
+    lines.append(f"<code>{_bar(fraction, 22)}</code>")
+    lines.append(f"<b>{fraction * 100:.1f}%</b>")
+    lines.append(f"<b>{done}</b> / {total}")
+    lines.append("")
+    lines.append("Remaining:")
+    lines.append(f"<code>{max(0, total - done)}</code> messages")
+    lines.append("")
+    lines.append(_SEP)
+
+    # 3. current file / message progress (different style)
+    lines.append("📦 <b>Current File</b>" if file else "📄 <b>Current Message</b>")
+    lines.append("")
+    if file:
+        fname = file.get("filename") or "file"
+        fdone = file.get("done", 0)
+        ftotal = file.get("total", 0)
+        ffraction = fdone / ftotal if ftotal else 0.0
+        lines.append(f"<code>{_bar2(ffraction, 10)}</code>")
+        lines.append(f"<b>{ffraction * 100:.0f}%</b>")
+        lines.append("")
+        lines.append(_escape(fname))
+        lines.append(f"<code>{_fmt_size(fdone)}</code> / <code>{_fmt_size(ftotal)}</code>")
+        fspeed = file.get("speed", 0.0)
+        if fspeed > 0:
+            lines.append("")
+            lines.append("Speed")
+            lines.append(f"<code>{_fmt_bps(fspeed)}</code>")
+        feta = file.get("eta", 0.0)
+        if feta > 0:
+            lines.append("")
+            lines.append("ETA")
+            lines.append(f"<code>{_fmt_elapsed(feta)}</code>")
+    else:
+        lines.append("⚡ <b>Instant Transfer</b>")
+    lines.append("")
+    lines.append(_SEP)
+
+    # 4. live statistics
+    lines.append("📊 <b>Live Statistics</b>")
+    lines.append("")
+    lines.append(f"✅ Completed: <code>{success}</code>")
+    lines.append(f"❌ Failed: <code>{failed}</code>")
+    lines.append(f"⏭ Skipped: <code>{skipped}</code>")
+    if current:
+        lines.append(f"📄 Current Message: <code>{current.get('msg_id')}</code>")
+    else:
+        lines.append("📄 Current Message: <code>—</code>")
+    lines.append(f"⚡ Speed: <code>{speed:.1f}</code> msg/s")
+    lines.append(f"⏱ Elapsed: <code>{_fmt_elapsed(elapsed)}</code>")
+    lines.append(f"⌛ ETA: <code>{_fmt_elapsed(eta)}</code>")
+    lines.append("")
+    lines.append(_SEP)
+
+    # 5. current source / destination
+    lines.append("📍 <b>Current Source</b>")
+    lines.append("")
+    lines.append(f"Source: <b>{_escape(source)}</b>")
+    lines.append(f"Destination: <b>{_escape(dest)}</b>")
+    if current_link:
+        lines.append("")
+        lines.append("Current Link")
+        lines.append(f"<code>{_escape(current_link)}</code>")
+
+    # 6. flood wait countdown
+    if flood is not None and flood > 0:
+        lines.append("")
+        lines.append(_SEP)
+        lines.append("⏳ <b>Telegram Rate Limit</b>")
+        lines.append("Waiting")
+        lines.append(f"<code>{int(flood)}</code> seconds")
+        lines.append("Transfer will continue automatically.")
+
     return "\n".join(lines)
 
 
-def run_done(summary_: dict, duration: float) -> str:
-    return (
-        "🎉 <b>Transfer complete!</b>\n\n"
-        f"Total: <b>{summary_['total']}</b>\n"
-        f"✅ Success: <b>{summary_['success']}</b>\n"
-        f"⏭ Skipped: <b>{summary_['skipped']}</b>\n"
-        f"❌ Failed: <b>{summary_['failed']}</b>\n"
-        f"⏱ Duration: <code>{_fmt_elapsed(duration)}</code>"
-    )
+def run_done(summary_: dict, duration: float, avg_speed: float | None = None,
+             dest_name: str = "") -> str:
+    lines = [
+        _SEP,
+        "",
+        "🎉 <b>Transfer Complete</b>",
+        "",
+        "Total",
+        f"<b>{summary_['total']}</b>",
+        "",
+        "Success",
+        f"<b>{summary_['success']}</b>",
+        "",
+        "Skipped",
+        f"<b>{summary_['skipped']}</b>",
+        "",
+        "Failed",
+        f"<b>{summary_['failed']}</b>",
+        "",
+        "Elapsed",
+        f"<code>{_fmt_elapsed(duration)}</code>",
+    ]
+    if avg_speed is not None:
+        lines += ["", "Average Speed", f"<b>{avg_speed:.1f}</b> msg/sec"]
+    if dest_name:
+        lines += ["", "Destination", f"<b>{_escape(dest_name)}</b>"]
+    lines += ["", _SEP]
+    return "\n".join(lines)
 
 
-def run_failed(summary_: dict, duration: float, reason: str) -> str:
-    return (
-        "🛑 <b>Transfer interrupted</b>\n\n"
-        f"Reason: <code>{_escape(reason)}</code>\n\n"
-        f"Success: <b>{summary_['success']}</b>\n"
-        f"Skipped: <b>{summary_['skipped']}</b>\n"
-        f"Failed: <b>{summary_['failed']}</b>\n"
-        f"⏱ Duration: <code>{_fmt_elapsed(duration)}</code>"
-    )
+def run_failed(summary_: dict, duration: float, reason: str,
+               dest_name: str = "") -> str:
+    lines = [
+        "🛑 <b>Transfer interrupted</b>",
+        "",
+        f"Reason: <code>{_escape(reason)}</code>",
+        "",
+        "Success",
+        f"<b>{summary_['success']}</b>",
+        "",
+        "Skipped",
+        f"<b>{summary_['skipped']}</b>",
+        "",
+        "Failed",
+        f"<b>{summary_['failed']}</b>",
+        "",
+        "Elapsed",
+        f"<code>{_fmt_elapsed(duration)}</code>",
+    ]
+    if dest_name:
+        lines += ["", "Destination", f"<b>{_escape(dest_name)}</b>"]
+    return "\n".join(lines)
+
+
+def _verb(mode: str) -> str:
+    if mode == "forward":
+        return "Forwarding"
+    if mode == "download":
+        return "Downloading"
+    return "Copying"
 
 
 def jobs_menu(jobs: list[dict]) -> str:
