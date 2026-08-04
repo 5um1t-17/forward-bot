@@ -104,7 +104,7 @@ def register_handlers(bot: TelegramClient) -> None:
         else:
             await bot.send_message(uid, text.menu_text(await db.get_user(uid)), buttons=keyboards.main_menu(), parse_mode="html")
 
-    @bot.on(events.CallbackQuery(incoming=True))
+    @bot.on(events.CallbackQuery())
     async def on_callback(event: events.CallbackQuery.Event) -> None:
         uid = event.sender_id
         if uid is None:
