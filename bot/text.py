@@ -292,31 +292,40 @@ def _bar(fraction: float, width: int = 12) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _bar2(fraction: float, width: int = 10) -> str:
+def _bar3(fraction: float, width: int = 14) -> str:
     fraction = max(0.0, min(1.0, fraction))
     filled = round(fraction * width)
-    return "▰" * filled + "▱" * (width - filled)
+    return "▓" * filled + "░" * (width - filled)
 
 
-def _op_icon(operation: str, paused: bool) -> str:
-    if paused:
-        return "⏸"
-    op = (operation or "").lower()
-    for key, icon in (
-        ("download", "📥"),
-        ("upload", "📤"),
-        ("forward", "➡️"),
-        ("copy", "📑"),
-        ("compres", "🗜"),
-        ("resolv", "🔍"),
-        ("flood", "⏳"),
-        ("wait", "⏳"),
-        ("skip", "⏭"),
-        ("pause", "⏸"),
-    ):
-        if key in op:
-            return icon
-    return "⚙️"
+def _type_icon(ctype: str) -> str:
+    t = (ctype or "").lower()
+    if "album" in t:
+        return "🎬"
+    if "photo" in t or "image" in t:
+        return "🖼"
+    if "video" in t:
+        return "🎬"
+    if "audio" in t or "voice" in t:
+        return "🎵"
+    if "sticker" in t:
+        return "🧩"
+    if "gif" in t:
+        return "🎞"
+    return "📄"
+
+
+def _fmt_bps(n: float) -> str:
+    return f"{_fmt_size(n)}/s"
+
+
+def _fmt_compact(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def _fmt_size(n: int | float) -> str:
@@ -335,13 +344,7 @@ _SEP = "━━━━━━━━━━━━━━━━━━━━"
 
 
 def progress_text(state: dict) -> str:
-    """Render the live, in-place-edited progress message.
-
-    Kept compact on purpose — it is re-rendered every few seconds, so a big
-    message is wasteful and hard to read on mobile.
-    """
-    mode = state.get("mode", "copy")
-    operation = state.get("operation") or _verb(mode)
+    """Render the live, in-place-edited progress message (boxed layout)."""
     paused = bool(state.get("paused", False))
     success = state.get("success", 0)
     skipped = state.get("skipped", 0)
@@ -349,45 +352,79 @@ def progress_text(state: dict) -> str:
     total = state.get("total", 0)
     done = success + skipped + failed
     elapsed = state.get("elapsed", 0.0)
-    speed = state.get("speed", 0.0)
     eta = state.get("eta", 0.0)
     current = state.get("current")
     file = state.get("file")
     flood = state.get("flood_wait")
     source = state.get("source_name") or "Source"
     dest = state.get("dest_name") or "Destination"
-    current_link = (current or {}).get("link")
 
-    lines: list[str] = []
-    lines.append(f"{_op_icon(operation, paused)} <b>{_escape(operation)}</b>")
+    top = "╭" + "─" * 38 + "╮"
+    bottom = "╰" + "─" * 38 + "╯"
+
+    lines: list[str] = [top, ""]
     if paused:
-        lines.append("<i>⏸ Paused — press Resume.</i>")
+        lines.append("⏸ <b>Transfer Paused</b>")
+    else:
+        lines.append("🚀 <b>Transfer in Progress</b>")
+    lines.append("")
+    lines.append("📊 <b>Overall</b>")
+    lines.append("")
 
     fraction = done / total if total else 0.0
     lines.append(f"<code>{_bar(fraction, 18)}</code> <b>{fraction * 100:.0f}%</b>")
-    lines.append(f"<b>{done}</b>/{total}  ✅ {success}  ❌ {failed}  ⏭ {skipped}")
+    lines.append(f"<b>{done}</b> / {total}  •  ✅ {success}  ⏭ {skipped}  ❌ {failed}")
+    lines.append("")
+    lines.append(_SEP)
+    lines.append("")
+    lines.append("📄 <b>Current</b>")
+    lines.append("")
 
     if current:
-        link = current_link or ""
-        link = f" · <code>{_escape(link[:48])}</code>" if link else ""
-        lines.append(
-            f"📄 {_escape(str(current.get('type') or 'Message'))} "
-            f"#<code>{current.get('msg_id')}</code>{link}"
-        )
+        ctype = str(current.get("type") or "Message")
+        if ctype.startswith("Album ·"):
+            ctype = f"Album ({ctype.split('·', 1)[1].strip()} files)"
+        lines.append(f"{_type_icon(ctype)} {_escape(ctype)}")
+        msg_id = current.get("msg_id")
+        if msg_id is not None:
+            lines.append(f"🆔 #{msg_id}")
+        link = current.get("link") or ""
+        if link:
+            lines.append(f"🔗 <code>{_escape(link)}</code>")
+    else:
+        lines.append("📄 <i>Preparing…</i>")
+
     if file:
-        fname = (file.get("filename") or "file")[:36]
+        fname = file.get("filename") or "file"
         fdone = file.get("done", 0)
         ftotal = file.get("total", 0)
         ffraction = fdone / ftotal if ftotal else 0.0
-        lines.append(f"📦 <code>{_bar2(ffraction, 8)}</code> {_escape(fname)} "
-                     f"{_fmt_size(fdone)}/{_fmt_size(ftotal)}")
-    lines.append(f"⚡ {speed:.1f} msg/s · ⏱ {_fmt_elapsed(elapsed)} · ⌛ {_fmt_elapsed(eta)}")
-    lines.append(f"📍 {_escape(source)} → {_escape(dest)}")
+        fspeed = file.get("speed", 0.0)
+        feta = file.get("eta", 0.0)
+        lines.append("")
+        lines.append(f"📥 {_escape(fname)}")
+        lines.append(f"<code>{_bar3(ffraction)}</code> <b>{ffraction * 100:.0f}%</b>")
+        lines.append("")
+        lines.append(f"{_fmt_size(fdone)} / {_fmt_size(ftotal)}")
+        if fspeed > 0:
+            lines.append(f"⚡ {_fmt_bps(fspeed)}")
+        lines.append(f"⏱ {_fmt_compact(elapsed)}")
+        if feta > 0:
+            lines.append(f"⌛ ETA {_fmt_compact(feta)}")
+    else:
+        lines.append("")
+        lines.append("📥 <i>Preparing…</i>")
+
+    lines.append("")
+    lines.append(f"📍 {_escape(source)} ➜ {_escape(dest)}")
 
     if flood is not None and flood > 0:
-        lines.append(_SEP)
-        lines.append(f"⏳ <b>Rate limit:</b> waiting <code>{int(flood)}s</code>, resumes automatically.")
+        lines.append("")
+        lines.append(f"⏳ <b>Rate limit:</b> waiting <code>{int(flood)}s</code> — resumes automatically")
 
+    lines.append("")
+    lines.append(_SEP)
+    lines.append(bottom)
     return "\n".join(lines)
 
 
