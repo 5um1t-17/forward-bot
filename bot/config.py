@@ -36,10 +36,18 @@ class Config:
     # Download & Re-upload speed: parallel transfers are multiplied past the
     # user's `threads` setting. Downloads and uploads use independent pools so
     # big files overlap as much as Telegram's limits allow.
-    DOWNLOAD_MULT: int = int(os.getenv("DOWNLOAD_MULT", "2"))
-    UPLOAD_MULT: int = int(os.getenv("UPLOAD_MULT", "2"))
-    MAX_DL_THREADS: int = int(os.getenv("MAX_DL_THREADS", "6"))
-    MAX_UP_THREADS: int = int(os.getenv("MAX_UP_THREADS", "6"))
+    DOWNLOAD_MULT: int = int(os.getenv("DOWNLOAD_MULT", "3"))
+    UPLOAD_MULT: int = int(os.getenv("UPLOAD_MULT", "3"))
+    MAX_DL_THREADS: int = int(os.getenv("MAX_DL_THREADS", "12"))
+    MAX_UP_THREADS: int = int(os.getenv("MAX_UP_THREADS", "12"))
+
+    # Telethon fetches download parts one at a time (max 512 KiB per request),
+    # so a single file is latency-bound (~part size / round-trip). These knobs
+    # make each large file fetch several parts concurrently, which multiplies
+    # the effective per-file download speed without changing the number of
+    # simultaneous files. Set DOWNLOAD_PARTS to 1 to disable.
+    DOWNLOAD_PARTS: int = int(os.getenv("DOWNLOAD_PARTS", "6"))
+    DOWNLOAD_PARALLEL_MIN: int = int(os.getenv("DOWNLOAD_PARALLEL_MIN", str(1 * 1024 * 1024)))
 
     # How often the live progress message is refreshed (seconds).
     PROGRESS_REFRESH: float = float(os.getenv("PROGRESS_REFRESH", "2"))

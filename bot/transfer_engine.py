@@ -827,13 +827,10 @@ class TransferEngine:
             tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
             temp_paths.add(tmp_path)
             self._file = None
-            path = await client.download_media(
-                msg,
-                file=tmp_path,
-                progress_callback=self._file_progress_cb(
-                    _msg_filename(msg) or f"message_{msg.id}", "Downloading"
-                ),
+            progress = self._file_progress_cb(
+                _msg_filename(msg) or f"message_{msg.id}", "Downloading"
             )
+            path = await self._download_media(client, msg, tmp_path, progress)
             if not path:
                 temp_paths.discard(tmp_path)
                 try:
@@ -854,6 +851,75 @@ class TransferEngine:
             except OSError:
                 pass
             return None
+
+    async def _download_media(self, client, msg, tmp_path: str, progress) -> str | None:
+        """Download one message's media, parallelising large documents."""
+        media = msg.media
+        doc = media.document if isinstance(media, types.MessageMediaDocument) else None
+        size = int(getattr(doc, "size", 0) or 0)
+        if doc is not None and size >= config.DOWNLOAD_PARALLEL_MIN:
+            location = types.InputDocumentFileLocation(
+                id=doc.id,
+                access_hash=doc.access_hash,
+                file_reference=doc.file_reference,
+                thumb_size="",
+            )
+            try:
+                return await self._download_media_parallel(
+                    client, location, size, tmp_path, progress, config.DOWNLOAD_PARTS
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("parallel download failed (msg %s), falling back: %s", msg.id, exc)
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return await client.download_media(msg, file=tmp_path, progress_callback=progress)
+
+    async def _download_media_parallel(
+        self, client, location, file_size: int, dest_path: str,
+        progress, parts: int,
+    ) -> str:
+        """Download one file using ``parts`` concurrent part requests."""
+        part_size = 512 * 1024
+        total_parts = max(1, (file_size + part_size - 1) // part_size)
+        n = max(1, min(parts, total_parts, 8))
+        with open(dest_path, "wb") as f:
+            f.truncate(file_size)
+
+        state = {"done": 0}
+
+        def report(delta: int) -> None:
+            state["done"] += delta
+            if progress is not None:
+                progress(state["done"], file_size)
+
+        async def worker(i: int) -> None:
+            start_part = (i * total_parts) // n
+            end_part = ((i + 1) * total_parts) // n
+            if end_part <= start_part:
+                return
+            offset = start_part * part_size
+            num = end_part - start_part
+            iterator = client.iter_download(
+                location,
+                file_size=file_size,
+                chunk_size=part_size,
+                request_size=part_size,
+                offset=offset,
+                stride=part_size,
+                limit=num,
+            )
+            pos = offset
+            async for chunk in iterator:
+                with open(dest_path, "r+b") as f:
+                    f.seek(pos)
+                    f.write(chunk)
+                    report(len(chunk))
+                pos += len(chunk)
+
+        await asyncio.gather(*(asyncio.create_task(worker(i)) for i in range(n)))
+        return dest_path
 
     async def _upload_item(
         self, client, cfg: TransferConfig, pkg: dict, reply_map: dict,
