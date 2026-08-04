@@ -51,6 +51,10 @@ class Config:
 
     FETCH_DIALOGS_TIMEOUT: int = int(os.getenv("FETCH_DIALOGS_TIMEOUT", "20"))
 
+    # Hard cap for connecting a user Telegram client (TCP + auth check). Keeps
+    # a single slow/unreachable DC from hanging a callback forever.
+    CLIENT_CONNECT_TIMEOUT: float = float(os.getenv("CLIENT_CONNECT_TIMEOUT", "25"))
+
     # How often the live progress message is refreshed (seconds).
     PROGRESS_REFRESH: float = float(os.getenv("PROGRESS_REFRESH", "2"))
 

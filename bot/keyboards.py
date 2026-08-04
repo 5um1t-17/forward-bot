@@ -89,6 +89,13 @@ def dest_confirm_keyboard() -> list[list]:
     ]
 
 
+def dest_manual_keyboard() -> list[list]:
+    return [
+        [Button.inline("✏️ Enter destination manually", b"dst:manual")],
+        [Button.inline("🔙 Back", b"menu")],
+    ]
+
+
 def count_keyboard() -> list[list]:
     return [
         [Button.inline("Latest 10", b"tr:count:10"),

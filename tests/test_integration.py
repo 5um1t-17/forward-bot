@@ -66,7 +66,12 @@ class FakeClient:
             yield m
 
     async def iter_dialogs(self, limit=0):
+        for d in await self.get_dialogs(limit=limit):
+            yield d
+
+    async def get_dialogs(self, limit=0):
         now_dt = datetime.now(timezone.utc)
+        out = []
         for cid, title in ((-100222, "Dest Channel"), (-100333, "Dest Group")):
             ch = types.Channel(
                 id=cid,
@@ -80,7 +85,8 @@ class FakeClient:
                 creator=True,
                 admin_rights=types.ChatAdminRights(post_messages=True),
             )
-            yield _Dialog(ch)
+            out.append(_Dialog(ch))
+        return out
 
     async def connect(self):
         return True

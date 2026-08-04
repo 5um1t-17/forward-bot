@@ -115,6 +115,14 @@ def dest_prompt() -> str:
     )
 
 
+def dest_timeout_prompt() -> str:
+    return (
+        "⚠️ Your chat list took too long to load.\n\n"
+        "No problem — you can still pick the destination by "
+        "sending its <b>link</b>, <b>username</b> or <b>ID</b> manually."
+    )
+
+
 def dest_confirmed(name: str, chat_id: int) -> str:
     return (
         f"✅ <b>Destination set</b>\n\n"
@@ -323,18 +331,14 @@ def _fmt_size(n: int | float) -> str:
     return f"{n:.1f} {units[u]}"
 
 
-def _fmt_bps(n: float) -> str:
-    return f"{_fmt_size(n)}/s"
-
-
 _SEP = "━━━━━━━━━━━━━━━━━━━━"
 
 
 def progress_text(state: dict) -> str:
     """Render the live, in-place-edited progress message.
 
-    The engine pushes a rich snapshot: current message info, per-file byte
-    progress, operation, FloodWait countdown, stats and source/destination.
+    Kept compact on purpose — it is re-rendered every few seconds, so a big
+    message is wasteful and hard to read on mobile.
     """
     mode = state.get("mode", "copy")
     operation = state.get("operation") or _verb(mode)
@@ -345,8 +349,8 @@ def progress_text(state: dict) -> str:
     total = state.get("total", 0)
     done = success + skipped + failed
     elapsed = state.get("elapsed", 0.0)
-    speed = state.get("speed", 0.0)          # messages / sec
-    eta = state.get("eta", 0.0)              # overall remaining seconds
+    speed = state.get("speed", 0.0)
+    eta = state.get("eta", 0.0)
     current = state.get("current")
     file = state.get("file")
     flood = state.get("flood_wait")
@@ -354,109 +358,35 @@ def progress_text(state: dict) -> str:
     dest = state.get("dest_name") or "Destination"
     current_link = (current or {}).get("link")
 
-    lines: list[str] = [
-        f"{_op_icon(operation, paused)} <b>{_escape(operation)}</b>",
-    ]
+    lines: list[str] = []
+    lines.append(f"{_op_icon(operation, paused)} <b>{_escape(operation)}</b>")
     if paused:
-        lines.append("<i>⏸ Transfer paused — press Resume to continue.</i>")
-    lines.append("")
-    lines.append(_SEP)
+        lines.append("<i>⏸ Paused — press Resume.</i>")
 
-    # 1. current message
-    lines.append("📥 <b>Current Message</b>")
-    lines.append("")
-    if current:
-        link = current.get("link") or ""
-        if link:
-            lines.append(f"🔗 <code>{_escape(link)}</code>")
-        lines.append(f"Message ID: <code>{current.get('msg_id')}</code>")
-        lines.append(f"Type: <b>{_escape(current.get('type') or 'Message')}</b>")
-        size = current.get("size") or 0
-        if size:
-            lines.append(f"Size: <code>{_fmt_size(size)}</code>")
-    else:
-        lines.append("<i>Preparing…</i>")
-    lines.append("")
-    lines.append("⏭ If this message is taking too long:")
-    lines.append("<code>/skip</code>")
-    lines.append("")
-    lines.append(_SEP)
-
-    # 2. overall progress bar
-    lines.append("🚀 <b>Overall Transfer</b>")
-    lines.append("")
     fraction = done / total if total else 0.0
-    lines.append(f"<code>{_bar(fraction, 22)}</code>")
-    lines.append(f"<b>{fraction * 100:.1f}%</b>")
-    lines.append(f"<b>{done}</b> / {total}")
-    lines.append("")
-    lines.append("Remaining:")
-    lines.append(f"<code>{max(0, total - done)}</code> messages")
-    lines.append("")
-    lines.append(_SEP)
+    lines.append(f"<code>{_bar(fraction, 18)}</code> <b>{fraction * 100:.0f}%</b>")
+    lines.append(f"<b>{done}</b>/{total}  ✅ {success}  ❌ {failed}  ⏭ {skipped}")
 
-    # 3. current file / message progress (different style)
-    lines.append("📦 <b>Current File</b>" if file else "📄 <b>Current Message</b>")
-    lines.append("")
+    if current:
+        link = current_link or ""
+        link = f" · <code>{_escape(link[:48])}</code>" if link else ""
+        lines.append(
+            f"📄 {_escape(str(current.get('type') or 'Message'))} "
+            f"#<code>{current.get('msg_id')}</code>{link}"
+        )
     if file:
-        fname = file.get("filename") or "file"
+        fname = (file.get("filename") or "file")[:36]
         fdone = file.get("done", 0)
         ftotal = file.get("total", 0)
         ffraction = fdone / ftotal if ftotal else 0.0
-        lines.append(f"<code>{_bar2(ffraction, 10)}</code>")
-        lines.append(f"<b>{ffraction * 100:.0f}%</b>")
-        lines.append("")
-        lines.append(_escape(fname))
-        lines.append(f"<code>{_fmt_size(fdone)}</code> / <code>{_fmt_size(ftotal)}</code>")
-        fspeed = file.get("speed", 0.0)
-        if fspeed > 0:
-            lines.append("")
-            lines.append("Speed")
-            lines.append(f"<code>{_fmt_bps(fspeed)}</code>")
-        feta = file.get("eta", 0.0)
-        if feta > 0:
-            lines.append("")
-            lines.append("ETA")
-            lines.append(f"<code>{_fmt_elapsed(feta)}</code>")
-    else:
-        lines.append("⚡ <b>Instant Transfer</b>")
-    lines.append("")
-    lines.append(_SEP)
+        lines.append(f"📦 <code>{_bar2(ffraction, 8)}</code> {_escape(fname)} "
+                     f"{_fmt_size(fdone)}/{_fmt_size(ftotal)}")
+    lines.append(f"⚡ {speed:.1f} msg/s · ⏱ {_fmt_elapsed(elapsed)} · ⌛ {_fmt_elapsed(eta)}")
+    lines.append(f"📍 {_escape(source)} → {_escape(dest)}")
 
-    # 4. live statistics
-    lines.append("📊 <b>Live Statistics</b>")
-    lines.append("")
-    lines.append(f"✅ Completed: <code>{success}</code>")
-    lines.append(f"❌ Failed: <code>{failed}</code>")
-    lines.append(f"⏭ Skipped: <code>{skipped}</code>")
-    if current:
-        lines.append(f"📄 Current Message: <code>{current.get('msg_id')}</code>")
-    else:
-        lines.append("📄 Current Message: <code>—</code>")
-    lines.append(f"⚡ Speed: <code>{speed:.1f}</code> msg/s")
-    lines.append(f"⏱ Elapsed: <code>{_fmt_elapsed(elapsed)}</code>")
-    lines.append(f"⌛ ETA: <code>{_fmt_elapsed(eta)}</code>")
-    lines.append("")
-    lines.append(_SEP)
-
-    # 5. current source / destination
-    lines.append("📍 <b>Current Source</b>")
-    lines.append("")
-    lines.append(f"Source: <b>{_escape(source)}</b>")
-    lines.append(f"Destination: <b>{_escape(dest)}</b>")
-    if current_link:
-        lines.append("")
-        lines.append("Current Link")
-        lines.append(f"<code>{_escape(current_link)}</code>")
-
-    # 6. flood wait countdown
     if flood is not None and flood > 0:
-        lines.append("")
         lines.append(_SEP)
-        lines.append("⏳ <b>Telegram Rate Limit</b>")
-        lines.append("Waiting")
-        lines.append(f"<code>{int(flood)}</code> seconds")
-        lines.append("Transfer will continue automatically.")
+        lines.append(f"⏳ <b>Rate limit:</b> waiting <code>{int(flood)}s</code>, resumes automatically.")
 
     return "\n".join(lines)
 
