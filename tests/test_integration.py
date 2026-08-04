@@ -65,7 +65,7 @@ class FakeClient:
         for m in reversed(self.msgs):
             yield m
 
-    async def iter_dialogs(self):
+    async def iter_dialogs(self, limit=0):
         now_dt = datetime.now(timezone.utc)
         for cid, title in ((-100222, "Dest Channel"), (-100333, "Dest Group")):
             ch = types.Channel(
@@ -166,7 +166,7 @@ async def main():
     await transfer.handle(bot, ev, "tr:src:ok")
     wiz = store.get_transfer(1)
     if len(wiz.dialogs) < 2:
-        print("DEBUG edited:", ev.edited)
+        pass  # debug removed for Windows console compatibility
     assert len(wiz.dialogs) >= 2, wiz.dialogs
 
     ev = FakeEvent(1, data=f"dst:sel:{wiz.dialogs[0]['id']}")

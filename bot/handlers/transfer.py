@@ -172,7 +172,7 @@ async def _ask_dest(bot, event, uid: int) -> bool:
     try:
         sid = await db.get_active_sid(uid)
         client = await client_pool.get(uid, sid)
-        wiz.dialogs = await fetch_sendable_dialogs(client)
+        wiz.dialogs = await fetch_sendable_dialogs(client, limit=100)
     except Exception as exc:
         log.warning("dialogs failed: %s", exc)
         await edit(event, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.back_row())

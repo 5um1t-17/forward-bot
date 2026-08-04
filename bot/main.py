@@ -62,11 +62,14 @@ def register_handlers(bot: TelegramClient) -> None:
         uid = event.sender_id
         if uid is None:
             return
-        await db.upsert_user(
-            uid,
-            getattr(event.sender, "first_name", "") or "",
-            getattr(event.sender, "username", "") or "",
-        )
+        try:
+            await db.upsert_user(
+                uid,
+                getattr(event.sender, "first_name", "") or "",
+                getattr(event.sender, "username", "") or "",
+            )
+        except Exception:
+            log.debug("upsert_user failed", exc_info=True)
         raw = event.raw_text.strip() if event.raw_text else ""
         low = raw.lower()
         token = low.split(" ", 1)[0] if low else ""

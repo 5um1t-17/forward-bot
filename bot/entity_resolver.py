@@ -1,6 +1,7 @@
 """Entity resolution: links, usernames, ids and forwarded messages."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -110,6 +111,8 @@ async def resolve(client: TelegramClient, text: str) -> Resolved | None:
     except (UsernameInvalidError, ChatIdInvalidError, ValueError) as exc:
         log.warning("resolve failed for %r: %s", text, exc)
         return None
+    except asyncio.TimeoutError:
+        log.warning("fetch_sendable_dialogs timed out after %ss", config.FETCH_DIALOGS_TIMEOUT)
     except Exception as exc:  # FloodWait, ChannelPrivate, etc.
         log.warning("resolve error for %r: %s", text, exc)
         return None
@@ -157,26 +160,33 @@ def _to_resolved(entity, input_type: str) -> Resolved:
     return Resolved(entity=entity, title=title, chat_id=entity.id, input_type=input_type)
 
 
-async def fetch_sendable_dialogs(client: TelegramClient) -> list[dict]:
-    """Group/channel dialogs the account can (likely) post to."""
+async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> list[dict]:
+    """Group/channel dialogs the account can (likely) post to.
+
+    Limited to ``limit`` dialogs and bounded by ``FETCH_DIALOGS_TIMEOUT``
+    seconds so the wizard never hangs forever on accounts with hundreds of
+    chats or on slow networks like Render free tier.
+    """
+    from bot.config import config
     from telethon.tl.types import Channel, Chat
 
     dialogs = []
     try:
-        async for dialog in client.iter_dialogs():
-            entity = dialog.entity
-            if not isinstance(entity, (Channel, Chat)):
-                continue
-            if isinstance(entity, Channel):
-                if entity.broadcast:
-                    # channel: requires admin rights to post
-                    if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                        continue
-                elif getattr(entity, "read_only", False):
-                    # read-only supergroup
-                    if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                        continue
-            dialogs.append({"id": entity.id, "title": dialog.name or str(entity.id)})
+        async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT):
+            async for dialog in client.iter_dialogs(limit=limit):
+                entity = dialog.entity
+                if not isinstance(entity, (Channel, Chat)):
+                    continue
+                if isinstance(entity, Channel):
+                    if entity.broadcast:
+                        # channel: requires admin rights to post
+                        if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
+                            continue
+                    elif getattr(entity, "read_only", False):
+                        # read-only supergroup
+                        if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
+                            continue
+                dialogs.append({"id": entity.id, "title": dialog.name or str(entity.id)})
     except Exception as exc:
         log.warning("fetch_sendable_dialogs failed: %s", exc)
     # de-dupe by id

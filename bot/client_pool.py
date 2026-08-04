@@ -5,6 +5,7 @@ of the process, so transfers start instantly after the first use.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telethon.tl.functions.account import UpdateStatusRequest
@@ -28,7 +29,10 @@ class ClientPool:
         if session_string is None:
             raise ValueError("Session not found or failed to decrypt")
         client = session_manager.build_client(session_string)
-        await client.connect()
+        try:
+            await asyncio.wait_for(client.connect(), timeout=20)
+        except asyncio.TimeoutError:
+            raise ValueError("Telegram connection timed out — try again in a moment")
         if not await client.is_user_authorized():
             raise ValueError("Session is no longer authorized — please re-add the account")
         self._clients[key] = client

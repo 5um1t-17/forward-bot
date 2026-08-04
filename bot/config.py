@@ -49,6 +49,8 @@ class Config:
     DOWNLOAD_PARTS: int = int(os.getenv("DOWNLOAD_PARTS", "6"))
     DOWNLOAD_PARALLEL_MIN: int = int(os.getenv("DOWNLOAD_PARALLEL_MIN", str(1 * 1024 * 1024)))
 
+    FETCH_DIALOGS_TIMEOUT: int = int(os.getenv("FETCH_DIALOGS_TIMEOUT", "20"))
+
     # How often the live progress message is refreshed (seconds).
     PROGRESS_REFRESH: float = float(os.getenv("PROGRESS_REFRESH", "2"))
 
