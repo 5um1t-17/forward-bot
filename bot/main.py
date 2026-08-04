@@ -104,12 +104,26 @@ def register_handlers(bot: TelegramClient) -> None:
         else:
             await bot.send_message(uid, text.menu_text(await db.get_user(uid)), buttons=keyboards.main_menu(), parse_mode="html")
 
-    @bot.on(events.CallbackQuery())
+    @bot.on(events.CallbackQuery(incoming=True))
     async def on_callback(event: events.CallbackQuery.Event) -> None:
         uid = event.sender_id
         if uid is None:
             return
-        data = event.data.decode()
+        if not event.data:
+            try:
+                await event.answer()
+            except Exception:
+                pass
+            return
+        try:
+            data = event.data.decode()
+        except Exception:
+            log.debug("callback decode failed", exc_info=True)
+            try:
+                await event.answer()
+            except Exception:
+                pass
+            return
         if data == "menu":
             store.set_pending(uid, None)
             store.reset_transfer(uid)
