@@ -220,7 +220,8 @@ class TransferEngine:
         # live progress snapshot attributes
         self._operation = "Starting"
         self._current_msg: dict | None = None
-        self._file: dict | None = None
+        self._file_dl: dict | None = None
+        self._file_up: dict | None = None
         self._flood_wait: float | None = None
 
     # ------------------------------------------------------------------
@@ -328,13 +329,18 @@ class TransferEngine:
             "paused": self._paused,
             "flood_wait": self._flood_wait,
             "current": self._current_msg,
-            "file": self._file,
+            "file_dl": self._file_dl,
+            "file_up": self._file_up,
             "source_name": cfg.source_name,
             "dest_name": cfg.dest_name,
         }
 
-    def _file_progress_cb(self, filename: str, operation: str):
-        """Build a Telethon progress_callback that feeds the live snapshot."""
+    def _file_progress_cb(self, filename: str, operation: str, which: str = "dl"):
+        """Build a Telethon progress_callback that feeds the live snapshot.
+
+        ``which`` selects the slot: "dl" for downloads, "up" for uploads.
+        """
+        slot = "_file_dl" if which == "dl" else "_file_up"
         st = {"ts": 0.0, "prev": 0.0}
 
         def cb(received: int, total: int) -> None:
@@ -349,13 +355,13 @@ class TransferEngine:
                 st["ts"] = now
                 st["prev"] = received
             total = total or 0
-            self._file = {
+            setattr(self, slot, {
                 "filename": filename or "file",
                 "done": received,
                 "total": total,
                 "speed": speed,
                 "eta": (total - received) / speed if speed > 0 and total else 0.0,
-            }
+            })
             self._operation = operation
 
         return cb
@@ -375,7 +381,8 @@ class TransferEngine:
         self._pause_evt.clear()
         self._operation = "Resolving Link"
         self._current_msg = None
-        self._file = None
+        self._file_dl = None
+        self._file_up = None
         self._flood_wait = None
         result = TransferResult(total=len(cfg.message_ids))
         start = time.monotonic()
@@ -621,7 +628,7 @@ class TransferEngine:
                                     lambda p=path: client.upload_file(
                                         p,
                                         progress_callback=self._file_progress_cb(
-                                            os.path.basename(p), "Uploading"
+                                            os.path.basename(p), "Uploading", "up"
                                         ),
                                     ),
                                     skip_idx=idx, progress_cb=progress_cb,
@@ -834,9 +841,9 @@ class TransferEngine:
             ext = _media_extension(msg)
             tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
             temp_paths.add(tmp_path)
-            self._file = None
+            self._file_dl = None
             progress = self._file_progress_cb(
-                _msg_filename(msg) or f"message_{msg.id}", "Downloading"
+                _msg_filename(msg) or f"message_{msg.id}", "Downloading", "dl"
             )
             path = await self._download_media(client, msg, tmp_path, progress)
             if not path:
@@ -1316,12 +1323,12 @@ class TransferEngine:
                     for m in media_msgs:
                         ext = _media_extension(m)
                         tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
-                        self._file = None
+                        self._file_dl = None
                         path = await client.download_media(
                             m,
                             file=tmp_path,
                             progress_callback=self._file_progress_cb(
-                                _msg_filename(m) or f"message_{m.id}", "Downloading"
+                                _msg_filename(m) or f"message_{m.id}", "Downloading", "dl"
                             ),
                         )
                         if path:
@@ -1350,12 +1357,12 @@ class TransferEngine:
                         tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
                         path = None
                         try:
-                            self._file = None
+                            self._file_dl = None
                             path = await client.download_media(
                                 m,
                                 file=tmp_path,
                                 progress_callback=self._file_progress_cb(
-                                    _msg_filename(m) or f"message_{m.id}", "Downloading"
+                                    _msg_filename(m) or f"message_{m.id}", "Downloading", "dl"
                                 ),
                             )
                             if path:

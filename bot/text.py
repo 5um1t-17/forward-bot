@@ -298,21 +298,10 @@ def _bar3(fraction: float, width: int = 14) -> str:
     return "▓" * filled + "░" * (width - filled)
 
 
-def _type_icon(ctype: str) -> str:
-    t = (ctype or "").lower()
-    if "album" in t:
-        return "🎬"
-    if "photo" in t or "image" in t:
-        return "🖼"
-    if "video" in t:
-        return "🎬"
-    if "audio" in t or "voice" in t:
-        return "🎵"
-    if "sticker" in t:
-        return "🧩"
-    if "gif" in t:
-        return "🎞"
-    return "📄"
+def _bar2(fraction: float, width: int = 10) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * width)
+    return "▰" * filled + "▱" * (width - filled)
 
 
 def _fmt_bps(n: float) -> str:
@@ -343,6 +332,25 @@ def _fmt_size(n: int | float) -> str:
 _SEP = "━━━━━━━━━━━━━━━━━━━━"
 
 
+def _file_block(icon: str, label: str, fdata: dict, bar_fn, width: int) -> list[str]:
+    done = fdata.get("done", 0)
+    total = fdata.get("total", 0)
+    frac = done / total if total else 0.0
+    speed = fdata.get("speed", 0.0)
+    eta = fdata.get("eta", 0.0)
+    size_line = f"{_fmt_size(done)} / {_fmt_size(total)}"
+    if speed > 0:
+        size_line += f" • ⚡{_fmt_bps(speed)}"
+    lines = [
+        f"{icon} <b>{label}</b>",
+        f"<code>{bar_fn(frac, width)}</code> <b>{frac * 100:.0f}%</b>",
+        size_line,
+    ]
+    if eta > 0:
+        lines.append(f"⌛ {_fmt_compact(eta)}")
+    return lines
+
+
 def progress_text(state: dict) -> str:
     """Render the live, in-place-edited progress message (boxed layout)."""
     paused = bool(state.get("paused", False))
@@ -351,79 +359,57 @@ def progress_text(state: dict) -> str:
     failed = state.get("failed", 0)
     total = state.get("total", 0)
     done = success + skipped + failed
-    elapsed = state.get("elapsed", 0.0)
-    eta = state.get("eta", 0.0)
     current = state.get("current")
-    file = state.get("file")
+    dl = state.get("file_dl")
+    up = state.get("file_up")
     flood = state.get("flood_wait")
     source = state.get("source_name") or "Source"
     dest = state.get("dest_name") or "Destination"
 
-    top = "╭" + "─" * 38 + "╮"
-    bottom = "╰" + "─" * 38 + "╯"
+    title = "⏸ Transfer Paused" if paused else "🚀 Transfer"
+    top = "╭" + "─" * 8 + " " + title + " " + "─" * 8 + "╮"
+    bottom = "╰" + "─" * 29 + "╯"
 
     lines: list[str] = [top, ""]
-    if paused:
-        lines.append("⏸ <b>Transfer Paused</b>")
-    else:
-        lines.append("🚀 <b>Transfer in Progress</b>")
-    lines.append("")
+
     lines.append("📊 <b>Overall</b>")
-    lines.append("")
-
     fraction = done / total if total else 0.0
-    lines.append(f"<code>{_bar(fraction, 18)}</code> <b>{fraction * 100:.0f}%</b>")
-    lines.append(f"<b>{done}</b> / {total}  •  ✅ {success}  ⏭ {skipped}  ❌ {failed}")
-    lines.append("")
-    lines.append(_SEP)
-    lines.append("")
-    lines.append("📄 <b>Current</b>")
+    lines.append(f"<code>{_bar(fraction, 14)}</code> <b>{fraction * 100:.0f}%</b> • <b>{done}</b>/{total}")
+    lines.append(f"✅ {success}  ⏭ {skipped}  ❌ {failed}")
     lines.append("")
 
+    lines.append("📄 <b>Current</b>")
     if current:
         ctype = str(current.get("type") or "Message")
         if ctype.startswith("Album ·"):
-            ctype = f"Album ({ctype.split('·', 1)[1].strip()} files)"
-        lines.append(f"{_type_icon(ctype)} {_escape(ctype)}")
+            ctype = f"Album ({ctype.split('·', 1)[1].strip()})"
         msg_id = current.get("msg_id")
         if msg_id is not None:
-            lines.append(f"🆔 #{msg_id}")
-        link = current.get("link") or ""
+            lines.append(f"📄 #{msg_id} • {_escape(ctype)}")
+        else:
+            lines.append(f"📄 {_escape(ctype)}")
+        link = (current.get("link") or "").replace("https://", "").replace("http://", "")
         if link:
             lines.append(f"🔗 <code>{_escape(link)}</code>")
     else:
         lines.append("📄 <i>Preparing…</i>")
+    lines.append("")
 
-    if file:
-        fname = file.get("filename") or "file"
-        fdone = file.get("done", 0)
-        ftotal = file.get("total", 0)
-        ffraction = fdone / ftotal if ftotal else 0.0
-        fspeed = file.get("speed", 0.0)
-        feta = file.get("eta", 0.0)
+    if dl:
+        lines.extend(_file_block("📥", "Download", dl, _bar2, 10))
         lines.append("")
-        lines.append(f"📥 {_escape(fname)}")
-        lines.append(f"<code>{_bar3(ffraction)}</code> <b>{ffraction * 100:.0f}%</b>")
+    if up:
+        lines.extend(_file_block("📤", "Upload", up, _bar3, 12))
         lines.append("")
-        lines.append(f"{_fmt_size(fdone)} / {_fmt_size(ftotal)}")
-        if fspeed > 0:
-            lines.append(f"⚡ {_fmt_bps(fspeed)}")
-        lines.append(f"⏱ {_fmt_compact(elapsed)}")
-        if feta > 0:
-            lines.append(f"⌛ ETA {_fmt_compact(feta)}")
-    else:
-        lines.append("")
+    if not dl and not up:
         lines.append("📥 <i>Preparing…</i>")
-
-    lines.append("")
-    lines.append(f"📍 {_escape(source)} ➜ {_escape(dest)}")
-
-    if flood is not None and flood > 0:
         lines.append("")
-        lines.append(f"⏳ <b>Rate limit:</b> waiting <code>{int(flood)}s</code> — resumes automatically")
+
+    lines.append(f"📍 {_escape(source)} ➜ {_escape(dest)}")
+    if flood is not None and flood > 0:
+        lines.append(f"⏳ Rate limit: waiting <code>{int(flood)}s</code>")
 
     lines.append("")
-    lines.append(_SEP)
     lines.append(bottom)
     return "\n".join(lines)
 

@@ -446,7 +446,8 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         "paused": False,
         "flood_wait": None,
         "current": None,
-        "file": None,
+        "file_dl": None,
+        "file_up": None,
         "source_name": cfg.source_name,
         "dest_name": cfg.dest_name,
     }
