@@ -337,15 +337,15 @@ async def test_download_upload_overlap():
 async def test_download_pipeline_stop():
     src = FakeEntity(1)
     dst = FakeEntity(2)
-    msgs = [_media_msg(i) for i in range(1, 60)]
-    client = DownloadClient(msgs, delays={i: 0.02 for i in range(1, 60)})
+    msgs = [_media_msg(i) for i in range(1, 200)]
+    client = DownloadClient(msgs, delays={i: 0.05 for i in range(1, 200)})
     eng = TransferEngine()
 
     async def stopper():
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.25)
         eng.request_stop()
 
-    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=list(range(1, 60)),
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=list(range(1, 200)),
                          mode="download", threads=4, dedup=False, sid="abc")
     stop_task = asyncio.create_task(stopper())
     result = await asyncio.wait_for(eng.run(client, cfg), timeout=10)

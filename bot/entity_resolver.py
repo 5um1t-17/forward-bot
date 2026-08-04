@@ -111,8 +111,6 @@ async def resolve(client: TelegramClient, text: str) -> Resolved | None:
     except (UsernameInvalidError, ChatIdInvalidError, ValueError) as exc:
         log.warning("resolve failed for %r: %s", text, exc)
         return None
-    except asyncio.TimeoutError:
-        log.warning("fetch_sendable_dialogs timed out after %ss", config.FETCH_DIALOGS_TIMEOUT)
     except Exception as exc:  # FloodWait, ChannelPrivate, etc.
         log.warning("resolve error for %r: %s", text, exc)
         return None
@@ -165,7 +163,8 @@ async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> li
 
     Limited to ``limit`` dialogs and bounded by ``FETCH_DIALOGS_TIMEOUT``
     seconds so the wizard never hangs forever on accounts with hundreds of
-    chats or on slow networks like Render free tier.
+    chats or on slow networks like Render free tier. Per-dialog errors are
+    caught individually so one bad dialog does not abort the whole scan.
     """
     from bot.config import config
     from telethon.tl.types import Channel, Chat
@@ -174,22 +173,25 @@ async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> li
     try:
         async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT):
             async for dialog in client.iter_dialogs(limit=limit):
-                entity = dialog.entity
+                try:
+                    entity = dialog.entity
+                except Exception as exc:
+                    log.debug("dialog entity fetch failed: %s", exc)
+                    continue
                 if not isinstance(entity, (Channel, Chat)):
                     continue
                 if isinstance(entity, Channel):
                     if entity.broadcast:
-                        # channel: requires admin rights to post
                         if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
                             continue
                     elif getattr(entity, "read_only", False):
-                        # read-only supergroup
                         if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
                             continue
                 dialogs.append({"id": entity.id, "title": dialog.name or str(entity.id)})
+    except asyncio.TimeoutError:
+        log.warning("fetch_sendable_dialogs timed out after %ss", config.FETCH_DIALOGS_TIMEOUT)
     except Exception as exc:
         log.warning("fetch_sendable_dialogs failed: %s", exc)
-    # de-dupe by id
     seen: set[int] = set()
     unique = []
     for d in dialogs:

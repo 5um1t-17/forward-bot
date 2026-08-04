@@ -581,6 +581,9 @@ class TransferEngine:
                         skip_idx=idx, progress_cb=progress_cb, state_builder=state_builder,
                     )
                 if pkg is not None:
+                    if self._stop.is_set():
+                        await ready.put((idx, None, "cancelled"))
+                        return
                     # hand off to a dedicated uploader task so the download
                     # slot is freed and uploads overlap with further downloads
                     task = asyncio.create_task(uploader(idx, pkg))
@@ -604,6 +607,9 @@ class TransferEngine:
             # Upload file bytes in parallel (bounded). The actual send stays
             # strictly ordered in the commit loop below.
             try:
+                if self._stop.is_set():
+                    await ready.put((idx, None, "cancelled"))
+                    return
                 async with up_sem:
                     if pkg["kind"] == "media":
                         for payload in pkg["payloads"]:
@@ -803,6 +809,8 @@ class TransferEngine:
         ]
 
         payloads: list[dict] = []
+        if self._stop.is_set():
+            return None
         if len(media_msgs) > 1:
             paths = await asyncio.gather(
                 *(self._download_one(client, m, temp_paths) for m in media_msgs)

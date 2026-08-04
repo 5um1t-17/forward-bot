@@ -308,6 +308,12 @@ async def _on_schedule(bot, event, uid: int, kind: str) -> bool:
         wiz.schedule_kind = "weekly"
         await edit(event, text.schedule_weekday_prompt(), keyboards.weekday_keyboard())
         return True
+    if kind.startswith("wd:"):
+        wiz.schedule_kind = "weekly"
+        wiz.schedule_weekday = int(kind.split(":", 1)[1])
+        store.set_pending(uid, "tr_sched_time")
+        await edit(event, text.schedule_time_prompt(), keyboards.back_row())
+        return True
     if kind in ("daily", "later"):
         wiz.schedule_kind = kind
         store.set_pending(uid, "tr_sched_time")
