@@ -149,7 +149,15 @@ class Database:
 
     async def init(self) -> None:
         try:
-            self.client = AsyncIOMotorClient(self._uri, serverSelectionTimeoutMS=5000)
+            self.client = AsyncIOMotorClient(
+                self._uri,
+                serverSelectionTimeoutMS=15000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000,
+                maxPoolSize=10,
+                minPoolSize=1,
+                maxIdleTimeMS=30000,
+            )
             self.db = self.client[self._db_name]
             self.users = self.db["users"]
             self.sessions = self.db["sessions"]
@@ -169,6 +177,45 @@ class Database:
             self.logs = in_memory.logs
             self.settings = in_memory.settings
             self.transferred = in_memory.transferred
+
+    async def ping(self) -> bool:
+        if self.client is None:
+            return False
+        try:
+            await self.client.admin.command("ping")
+            return True
+        except Exception:
+            return False
+
+    async def reconnect(self) -> bool:
+        if self.client is not None:
+            try:
+                await self.client.close()
+            except Exception:
+                pass
+            self.client = None
+        try:
+            self.client = AsyncIOMotorClient(
+                self._uri,
+                serverSelectionTimeoutMS=15000,
+                connectTimeoutMS=15000,
+                socketTimeoutMS=30000,
+                maxPoolSize=10,
+                minPoolSize=1,
+                maxIdleTimeMS=30000,
+            )
+            self.db = self.client[self._db_name]
+            self.users = self.db["users"]
+            self.sessions = self.db["sessions"]
+            self.jobs = self.db["jobs"]
+            self.logs = self.db["logs"]
+            self.settings = self.db["settings"]
+            self.transferred = self.db["transferred_messages"]
+            await self._ensure_indexes()
+            return True
+        except Exception as exc:
+            log.warning("MongoDB reconnect failed: %s", exc)
+            return False
 
     async def _ensure_indexes(self) -> None:
         await self.users.create_index("user_id", unique=True)

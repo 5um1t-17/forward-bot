@@ -54,9 +54,24 @@ class Scheduler:
         while True:
             await asyncio.sleep(config.SCHEDULER_INTERVAL)
             try:
+                await self._check_mongo()
+            except Exception:
+                log.exception("mongo health check failed")
+            try:
                 await self.tick()
             except Exception:
                 log.exception("scheduler tick failed")
+
+    async def _check_mongo(self) -> None:
+        if db.client is None:
+            return
+        if not await db.ping():
+            log.warning("MongoDB ping failed, attempting reconnect")
+            ok = await db.reconnect()
+            if ok:
+                log.info("MongoDB reconnected")
+            else:
+                log.warning("MongoDB reconnect failed, will retry next interval")
 
     async def tick(self) -> None:
         due = await db.due_jobs(utcnow())

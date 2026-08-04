@@ -911,12 +911,12 @@ class TransferEngine:
                 limit=num,
             )
             pos = offset
-            async for chunk in iterator:
-                with open(dest_path, "r+b") as f:
+            with open(dest_path, "r+b") as f:
+                async for chunk in iterator:
                     f.seek(pos)
                     f.write(chunk)
                     report(len(chunk))
-                pos += len(chunk)
+                    pos += len(chunk)
 
         await asyncio.gather(*(asyncio.create_task(worker(i)) for i in range(n)))
         return dest_path
