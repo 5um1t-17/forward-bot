@@ -177,6 +177,10 @@ async def main() -> None:
     await db.init()
     log.info("Connected to MongoDB at %s/%s", config.MONGO_URI, config.MONGO_DB)
 
+    from bot.transfer_engine import TransferEngine
+
+    TransferEngine.cleanup_stale_temp()
+
     os.makedirs(config.SESSION_DIR, exist_ok=True)
     bot = TelegramClient(os.path.join(config.SESSION_DIR, "bot"), config.API_ID, config.API_HASH)
     await bot.start(bot_token=config.BOT_TOKEN)

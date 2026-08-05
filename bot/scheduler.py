@@ -6,9 +6,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from bot import text
+from bot.client_pool import client_pool
 from bot.config import config
 from bot.db import db
-from bot.session_manager import session_manager
 from bot.transfer_engine import TransferConfig, TransferEngine
 
 log = logging.getLogger("bot.scheduler")
@@ -99,8 +99,14 @@ class Scheduler:
         sid = job["sid"]
         try:
             await db.mark_running(jid)
-            client = await self._build_client(user_id, sid)
-            cfg = await self._build_cfg(job, client)
+            # Use the shared client pool: exactly one client per account, so
+            # scheduled jobs never spin up a second session for the same
+            # account (which is what causes "wrong session ID" warnings).
+            client = await client_pool.get(user_id, sid)
+            # A fresh engine per run: concurrent jobs must never share the
+            # mutable run state (stop/skip/pause/progress) of one instance.
+            engine = TransferEngine()
+            cfg = await self._build_cfg(job, client, engine)
             log_doc = {
                 "user_id": user_id,
                 "jid": jid,
@@ -115,7 +121,7 @@ class Scheduler:
                 "status": "running",
             }
             log_id = await db.add_log(log_doc)
-            result = await self.engine.run(client, cfg)
+            result = await engine.run(client, cfg)
             await db.update_log(
                 log_id,
                 {
@@ -134,29 +140,19 @@ class Scheduler:
             await db.update_job(jid, {"status": "error", "last_error": str(exc)[:500]})
             await self._notify_error(user_id, job, exc)
 
-    async def _build_client(self, user_id: int, sid: str):
-        session_string = await session_manager.decrypt_session(user_id, sid)
-        if not session_string:
-            raise RuntimeError("Account session unavailable for this job.")
-        client = session_manager.build_client(session_string)
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise RuntimeError("Account no longer authorized.")
-        return client
-
-    async def _build_cfg(self, job: dict, client) -> TransferConfig:
+    async def _build_cfg(self, job: dict, client, engine: TransferEngine) -> TransferConfig:
         src = job["source"]
         dst = job["dest"]
         source_entity = await client.get_entity(src["id"])
         dest_entity = await client.get_entity(dst["id"])
         count_mode = job.get("count_mode", "latest")
         if count_mode == "latest":
-            ids = await self.engine.collect_ids(
+            ids = await engine.collect_ids(
                 client, source_entity, job.get("count", 10),
                 None, None, job.get("filter_type", "all"),
             )
         else:
-            ids = await self.engine.collect_ids(
+            ids = await engine.collect_ids(
                 client, source_entity, None,
                 job.get("custom_start"), job.get("custom_end"), job.get("filter_type", "all"),
             )

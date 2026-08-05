@@ -89,6 +89,13 @@ def dest_confirm_keyboard() -> list[list]:
     ]
 
 
+def dest_manual_keyboard() -> list[list]:
+    return [
+        [Button.inline("✏️ Enter destination manually", b"dst:manual")],
+        [Button.inline("🔙 Back", b"menu")],
+    ]
+
+
 def count_keyboard() -> list[list]:
     return [
         [Button.inline("Latest 10", b"tr:count:10"),
@@ -205,18 +212,18 @@ def edit_keyboard() -> list[list]:
 def running_keyboard(paused: bool = False) -> list[list]:
     if paused:
         return [
-            [Button.inline("▶ Resume", b"tr:run:resume")],
-            [Button.inline("⏭ Skip Current", b"tr:run:skip"),
-             Button.inline("🔄 Refresh", b"tr:run:refresh")],
-            [Button.inline("🛑 Stop Transfer", b"tr:run:stop"),
-             Button.inline("📊 Statistics", b"tr:run:stats")],
+            [Button.inline("▶ Resume", b"tr:run:resume"),
+             Button.inline("⏭ Skip Current", b"tr:run:skip")],
+            [Button.inline("🔄 Refresh", b"tr:run:refresh"),
+             Button.inline("🛑 Stop Transfer", b"tr:run:stop")],
+            [Button.inline("📊 Statistics", b"tr:run:stats")],
         ]
     return [
-        [Button.inline("⏸ Pause", b"tr:run:pause")],
-        [Button.inline("⏭ Skip Current", b"tr:run:skip"),
-         Button.inline("🔄 Refresh", b"tr:run:refresh")],
-        [Button.inline("🛑 Stop Transfer", b"tr:run:stop"),
-         Button.inline("📊 Statistics", b"tr:run:stats")],
+        [Button.inline("⏸ Pause", b"tr:run:pause"),
+         Button.inline("⏭ Skip Current", b"tr:run:skip")],
+        [Button.inline("🔄 Refresh", b"tr:run:refresh"),
+         Button.inline("🛑 Stop Transfer", b"tr:run:stop")],
+        [Button.inline("📊 Statistics", b"tr:run:stats")],
     ]
 
 

@@ -168,31 +168,26 @@ async def _ask_dest(bot, event, uid: int) -> bool:
     wiz = store.get_transfer(uid)
     store.set_pending(uid, None)
     wiz.dest_page = 0
-    try:
-        await event.edit("⏳ Loading destination chats...", buttons=None, parse_mode="html")
-    except Exception:
-        await event.respond("⏳ Loading destination chats...", parse_mode="html")
+    await edit(event, "⏳ Loading destination chats...", None)
+    timeout = config.FETCH_DIALOGS_TIMEOUT + config.CLIENT_CONNECT_TIMEOUT + 5
     try:
         sid = await db.get_active_sid(uid)
         client = await client_pool.get(uid, sid)
-        wiz.dialogs = await fetch_sendable_dialogs(client, limit=100)
+        wiz.dialogs = await asyncio.wait_for(
+            fetch_sendable_dialogs(client, limit=100), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        log.warning("destination dialog fetch timed out for user %s", uid)
+        await edit(event, text.dest_timeout_prompt(), keyboards.dest_manual_keyboard())
+        return True
     except Exception as exc:
         log.warning("dialogs failed: %s", exc)
-        try:
-            await event.edit(f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", buttons=keyboards.back_row(), parse_mode="html")
-        except Exception:
-            await event.respond(f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", buttons=keyboards.back_row(), parse_mode="html")
+        await edit(event, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
         return True
     if not wiz.dialogs:
-        try:
-            await event.edit("⚠️ No groups/channels found where you can post.", buttons=keyboards.back_row(), parse_mode="html")
-        except Exception:
-            await event.respond("⚠️ No groups/channels found where you can post.", buttons=keyboards.back_row(), parse_mode="html")
+        await edit(event, "⚠️ No groups/channels found where you can post.", keyboards.dest_manual_keyboard())
         return True
-    try:
-        await event.edit(text.dest_prompt(), buttons=keyboards.dest_keyboard(wiz.dialogs, 0), parse_mode="html")
-    except Exception:
-        await event.respond(text.dest_prompt(), buttons=keyboards.dest_keyboard(wiz.dialogs, 0), parse_mode="html")
+    await edit(event, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
     return True
 
 
@@ -451,7 +446,8 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         "paused": False,
         "flood_wait": None,
         "current": None,
-        "file": None,
+        "file_dl": None,
+        "file_up": None,
         "source_name": cfg.source_name,
         "dest_name": cfg.dest_name,
     }
