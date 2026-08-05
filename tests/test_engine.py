@@ -205,8 +205,12 @@ class DownloadClient(FakeClient):
         self.upload_delays = upload_delays or {}
         self.upload_order = []
         self.upload_ready_order = []
+        # strict order-of-events log: ("dl", msg_id) when a download starts,
+        # ("up", msg_id) when that item's upload finishes
+        self.sequence = []
 
     async def download_media(self, msg, file=None, progress_callback=None):
+        self.sequence.append(("dl", msg.id))
         if self.delays.get(msg.id):
             await asyncio.sleep(self.delays[msg.id])
         with open(file, "w") as f:
@@ -229,21 +233,25 @@ class DownloadClient(FakeClient):
                 with open(p) as f:
                     ids.append(int(f.read()))
                 self.upload_order.append(ids[-1])
+                self.sequence.append(("up", ids[-1]))
             sent = [FakeMessage(8000 + i) for i in range(len(ids))]
             self.sent.append(("dl_album", ids, kw))
             return sent
         with open(file) as f:
             mid = int(f.read())
         self.upload_order.append(mid)
+        self.sequence.append(("up", mid))
         self.sent.append(("dl_file", mid, kw))
         return FakeMessage(9000 + mid)
 
     async def send_message(self, dest, text, **kw):
         self.sent.append(("dl_text", text, kw))
         try:
-            self.upload_order.append(int(str(text).strip()))
+            mid = int(str(text).strip())
         except ValueError:
-            self.upload_order.append(-1)
+            mid = -1
+        self.upload_order.append(mid)
+        self.sequence.append(("up", mid))
         return FakeMessage(7000)
 
 
@@ -315,9 +323,10 @@ async def test_download_ordered_pipeline():
     print("download ordered pipeline OK")
 
 
-async def test_download_upload_overlap():
-    """File uploads must run in parallel (item 1's slow upload finishes last)
-    while sends are still committed strictly in source order."""
+async def test_download_strict_serial():
+    """One download and one upload at a time: item i's upload must finish
+    before item i+1's download starts (strict serial lifecycle, no overlap),
+    while sends still land in exact source order."""
     src = FakeEntity(1)
     dst = FakeEntity(2)
     msgs = [_media_msg(i) for i in range(1, 9)]
@@ -329,9 +338,11 @@ async def test_download_upload_overlap():
     res = await eng.run(client, cfg)
     assert res.success == 8 and res.failed == 0, res
     assert client.upload_order == list(range(1, 9)), client.upload_order
-    assert client.upload_ready_order[0] != 1 or len(client.upload_ready_order) < 8
-    assert client.upload_ready_order[-1] == 1, client.upload_ready_order
-    print("download upload overlap OK")
+    assert client.sequence == [("dl", 1), ("up", 1), ("dl", 2), ("up", 2),
+                               ("dl", 3), ("up", 3), ("dl", 4), ("up", 4),
+                               ("dl", 5), ("up", 5), ("dl", 6), ("up", 6),
+                               ("dl", 7), ("up", 7), ("dl", 8), ("up", 8)], client.sequence
+    print("download strict serial OK")
 
 
 async def test_download_pipeline_stop():
@@ -369,7 +380,7 @@ async def test_download_flood_cap():
         msgs = [_media_msg(i) for i in range(1, 4)]
 
         class FloodClient(DownloadClient):
-            async def upload_file(self, file, progress_callback=None):
+            async def send_file(self, dest, file, **kw):
                 raise FloodWaitError(None, 5)
 
         client = FloodClient(msgs)
@@ -415,7 +426,7 @@ async def main():
     await test_forward_strict_order()
     await test_download_ordered_pipeline()
     await test_download_mixed_order()
-    await test_download_upload_overlap()
+    await test_download_strict_serial()
     await test_download_pipeline_stop()
     await test_download_flood_cap()
     await test_download_progress_ticks()

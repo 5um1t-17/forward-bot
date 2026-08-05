@@ -34,12 +34,22 @@ class ClientPool:
     async def get(self, user_id: int, sid: str):
         key = (user_id, sid)
         client = self._clients.get(key)
-        if client is not None:
+        if client is not None and client.is_connected():
             return client
+        # Only one client may ever exist per account: the per-key lock plus the
+        # double-check guarantees concurrent callbacks never spin up a second
+        # session (and a second hung connection) for the same account.
         async with self._lock(key):
             client = self._clients.get(key)
-            if client is not None:
+            if client is not None and client.is_connected():
                 return client
+            if client is not None:
+                # pooled client dropped its connection — rebuild it fresh
+                self._clients.pop(key, None)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             session_string = await session_manager.decrypt_session(user_id, sid)
             if session_string is None:
                 raise ValueError("Session not found or failed to decrypt")

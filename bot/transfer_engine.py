@@ -1,19 +1,18 @@
-"""High-speed transfer engine.
+"""Reliable, order-preserving transfer engine.
 
 Strategy
 --------
-* Never downloads media in Forward/Copy mode. Forwarding uses
-  ``forward_messages`` (native, server-side). Copying recreates the message
-  server-side via ``send_file``/``send_message`` with the *existing* input
-  media, so no re-upload ever happens.
-* **Strict ordering**: forward/copy/dedup items are processed one at a time in
-  source order, so the destination always mirrors the source exactly.
-* **Download & Re-upload** mode (for restricted private groups) uses an
-  order-preserving high-speed pipeline: up to ``threads * DOWNLOAD_MULT``
-  downloads run in parallel, and file bytes are pre-uploaded in parallel too
-  (``upload_file``, up to ``threads * UPLOAD_MULT``), while the final send is
-  committed strictly in source order — so the heavy transfer is fully pipelined
-  yet the destination always mirrors the source.
+* All modes run through one strict sequential pipeline: items are processed
+  one at a time in ascending source order, so the destination always mirrors
+  the source exactly. At most one download and one upload is active at any
+  instant — never overlapping — which trades a little raw speed for
+  long-term stability at 24/7 scale. A single large file is still fetched
+  with several concurrent part-requests so big downloads stay fast.
+* Forwarding uses ``forward_messages`` (native, server-side). Copying recreates
+  the message server-side via ``send_file``/``send_message`` with the *existing*
+  input media (no re-upload). Download & Re-upload mode (for restricted private
+  groups) downloads each file to a temp file, immediately re-uploads it in
+  source order, then deletes the temp file before moving to the next item.
 * Message ids are processed in ascending order so reply chains can be
   mapped from source id to destination id.
 * Albums (``grouped_id``) are re-grouped so they remain albums in the
@@ -22,9 +21,14 @@ Strategy
   single operation keeps escalating its wait (cumulative > ``MAX_FLOOD_WAIT``)
   it gives up and counts the item as failed instead of hanging forever. While
   waiting, the live progress reports a per-second countdown.
+* Retryable failures (FloodWait / RPC / network / timeout) retry the *whole*
+  item up to ``retry_count`` times. Temp files are always removed in a
+  ``finally`` so /tmp never accumulates; stale ``fwd_*`` leftovers from a
+  crashed process are cleaned up at the start of every run.
 * Live progress: the engine maintains a rich snapshot (current message, current
   file bytes, operation, FloodWait countdown, paused state) that is pushed to
-  the ``progress_cb`` callback so the UI can refresh in place.
+  the ``progress_cb`` callback so the UI can refresh in place. A low-frequency
+  heartbeat keeps the snapshot alive while a long transfer is in flight.
 * Per-item **skip** (``request_skip``) cancels only the current message and the
   run continues with the next one. **Pause** (``request_pause`` /
   ``request_resume``) halts the run between messages without losing state.
@@ -53,6 +57,10 @@ from bot.config import config
 from bot.db import db
 
 log = logging.getLogger("bot.engine")
+
+# How often the engine pushes a live snapshot while a transfer is in flight
+# (the handler throttles actual message edits to PROGRESS_REFRESH).
+_HEARTBEAT_INTERVAL = 0.5
 
 ProgressCb = Callable[[dict], Awaitable[None]]
 
@@ -394,39 +402,19 @@ class TransferEngine:
             cfg.forward_delay,
             cfg.threads,
         )
+        self.cleanup_stale_temp()
         if progress_cb is not None:
             await progress_cb(state_builder())
 
-        if cfg.mode == "download":
-            # Order-preserving high-speed path: several downloads run in
-            # parallel (window = threads * DOWNLOAD_MULT) while uploads are
-            # committed strictly in source order, so the destination mirrors
-            # the source no matter how file sizes differ.
-            try:
-                await self._run_download_pipeline(client, cfg, result, progress_cb, start)
-            except asyncio.CancelledError:
-                result.cancelled = True
-                self._stop.set()
-            except Exception as exc:  # noqa: BLE001
-                log.exception("download transfer aborted")
-                result.cancelled = True
-                result.error = str(exc)
-            finally:
-                self._stop.set()
-            result.duration = time.monotonic() - start
-            if self._cancelled:
-                result.cancelled = True
-                if not result.error:
-                    result.error = "stopped by user"
-            elif result.cancelled and not result.error:
-                result.error = "stopped by user"
-            return result
+        beat_task: asyncio.Task | None = None
+        if progress_cb is not None:
+            beat_task = asyncio.create_task(self._heartbeat(progress_cb, state_builder))
 
         reply_map: dict[int, int] = {}
         ids = sorted(cfg.message_ids)
-        items = await self._collect_items(client, cfg, ids)
         aborted = False
         try:
+            items = await self._collect_items(client, cfg, ids)
             for i, item in enumerate(items):
                 self._current_index = i
                 if self._stop.is_set():
@@ -479,8 +467,24 @@ class TransferEngine:
             result.error = str(exc)
         finally:
             self._stop.set()
+            if beat_task is not None:
+                beat_task.cancel()
+                try:
+                    await beat_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         result.duration = time.monotonic() - start
+        log.info(
+            "Transfer run finished: mode=%s total=%d success=%d skipped=%d failed=%d cancelled=%s duration=%.1fs",
+            cfg.mode,
+            result.total,
+            result.success,
+            result.skipped,
+            result.failed,
+            result.cancelled,
+            result.duration,
+        )
         if self._cancelled:
             result.cancelled = True
             if not result.error:
@@ -535,243 +539,41 @@ class TransferEngine:
         return items
 
     # ------------------------------------------------------------------
-    # Order-preserving high-speed download / re-upload pipeline.
-    #
-    # Downloads are dispatched up to ``dl_window`` at a time (so big files
-    # overlap with the upload of the previous message), while uploads are
-    # committed strictly in source order. The destination therefore mirrors
-    # the source exactly, regardless of individual file sizes.
-    # ------------------------------------------------------------------
-    async def _run_download_pipeline(
-        self, client, cfg: TransferConfig, result: TransferResult,
-        progress_cb: ProgressCb | None, start: float,
-    ) -> None:
-        ids = sorted(cfg.message_ids)
-        items: list[dict] = []
-        for chunk_start in range(0, len(ids), config.BATCH_SIZE):
-            if self._stop.is_set():
-                break
-            chunk = ids[chunk_start:chunk_start + config.BATCH_SIZE]
-            msgs = await self._fetch_existing(client, cfg.source_entity, chunk)
-            items.extend(self._build_items(msgs, cfg))
-
-        reply_map: dict[int, int] = {}
-        state_builder = lambda: self._progress_state(result, cfg, start)  # noqa: E731
-        dl_window = max(1, min(cfg.threads * config.DOWNLOAD_MULT, config.MAX_DL_THREADS))
-        up_window = max(1, min(cfg.threads * config.UPLOAD_MULT, config.MAX_UP_THREADS))
-        sem = asyncio.Semaphore(dl_window)
-        up_sem = asyncio.Semaphore(up_window)
-        ready: asyncio.Queue = asyncio.Queue()
-        temp_paths: set[str] = set()
-        up_tasks: set[asyncio.Task] = set()
-        dl_tasks: dict[int, asyncio.Task] = {}
-        active_dl: set[asyncio.Task] = set()
-
-        async def downloader(idx: int, item: dict) -> None:
-            msgs = item["messages"]
-            src_id, dst_id = cfg.source_entity.id, cfg.dest_entity.id
+    @staticmethod
+    async def _heartbeat(progress_cb: ProgressCb, state_builder) -> None:
+        """Push a live snapshot periodically so a long transfer never looks
+        frozen. Cancelled by :meth:`run` when the run finishes."""
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
             try:
-                async with sem:
-                    if self._stop.is_set():
-                        await ready.put((idx, None, "cancelled"))
-                        return
-                    if cfg.dedup:
-                        for m in msgs:
-                            if await db.is_transferred(src_id, dst_id, m.id):
-                                result.skipped += len(msgs)
-                                await ready.put((idx, None, "skipped"))
-                                return
-                    self._operation = "Downloading"
-                    pkg = await self._with_retries(
-                        client, cfg,
-                        lambda: self._download_item(client, cfg, msgs, temp_paths),
-                        skip_idx=idx, progress_cb=progress_cb, state_builder=state_builder,
-                    )
-                if pkg is not None:
-                    if self._stop.is_set():
-                        await ready.put((idx, None, "cancelled"))
-                        return
-                    # hand off to a dedicated uploader task so the download
-                    # slot is freed and uploads overlap with further downloads
-                    task = asyncio.create_task(uploader(idx, pkg))
-                    up_tasks.add(task)
-                    task.add_done_callback(up_tasks.discard)
-                else:
-                    await ready.put((idx, None, "ok"))
-            except _SkipCurrent:
-                await ready.put((idx, None, "cancelled"))
-            except _Abort:
-                await ready.put((idx, None, "abort"))
-            except asyncio.CancelledError:
-                await ready.put((idx, None, "cancelled"))
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning("download failed for group starting msg %s: %s", msgs[0].id, exc)
-                result.failed += len(msgs)
-                await ready.put((idx, None, "failed"))
+                await progress_cb(state_builder())
+            except Exception:  # noqa: BLE001
+                log.debug("heartbeat progress update failed", exc_info=True)
 
-        async def uploader(idx: int, pkg: dict) -> None:
-            # Upload file bytes in parallel (bounded). The actual send stays
-            # strictly ordered in the commit loop below.
-            try:
-                if self._stop.is_set():
-                    await ready.put((idx, None, "cancelled"))
-                    return
-                async with up_sem:
-                    if pkg["kind"] == "media":
-                        for payload in pkg["payloads"]:
-                            path = payload.get("path")
-                            if path and "file" not in payload:
-                                self._operation = "Uploading"
-                                payload["file"] = await self._with_retries(
-                                    client, cfg,
-                                    lambda p=path: client.upload_file(
-                                        p,
-                                        progress_callback=self._file_progress_cb(
-                                            os.path.basename(p), "Uploading", "up"
-                                        ),
-                                    ),
-                                    skip_idx=idx, progress_cb=progress_cb,
-                                    state_builder=state_builder,
-                                )
-                await ready.put((idx, pkg, "ok"))
-            except _SkipCurrent:
-                await ready.put((idx, None, "cancelled"))
-            except _Abort:
-                await ready.put((idx, None, "abort"))
-            except asyncio.CancelledError:
-                await ready.put((idx, None, "cancelled"))
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning("file upload failed for group starting msg %s: %s", pkg["msgs"][0].id, exc)
-                result.failed += len(pkg["msgs"])
-                await ready.put((idx, None, "failed"))
+    @staticmethod
+    def cleanup_stale_temp(max_age: float = 3600.0) -> int:
+        """Remove leftover ``fwd_*`` temp files older than ``max_age`` seconds.
 
-        def cleanup_temp() -> None:
-            for path in list(temp_paths):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            temp_paths.clear()
-
-        def dispatch_more() -> None:
-            nonlocal next_dispatch
-            while (
-                next_dispatch < len(items)
-                and len(active_dl) < dl_window
-                and not self._paused
-                and not self._stop.is_set()
-            ):
-                idx = next_dispatch
-                task = asyncio.create_task(downloader(idx, items[idx]))
-                dl_tasks[idx] = task
-                active_dl.add(task)
-                task.add_done_callback(active_dl.discard)
-                next_dispatch += 1
-
-        next_seq = 0
-        next_dispatch = 0
-        pending: dict[int, tuple] = {}
-        remaining = len(items)
-        abort = False
-        dispatch_more()
+        Called at the start of every run (and at process startup), so a
+        previously crashed process can never leave files accumulating in /tmp.
+        """
+        removed = 0
         try:
-            while remaining and not abort:
-                if self._stop.is_set():
-                    abort = True
-                    break
-                self._current_index = next_seq
-                if next_seq < len(items):
-                    self._set_current(cfg, items[next_seq])
-                if self._paused:
-                    self._operation = "Paused"
-                    if progress_cb is not None:
-                        await progress_cb(state_builder())
-                    if not await self._wait_if_paused(progress_cb, state_builder):
-                        abort = True
-                        break
-                    dispatch_more()
+            for name in os.listdir(tempfile.gettempdir()):
+                if not name.startswith("fwd_"):
                     continue
-                # apply a pending skip to the current (oldest) item
-                if self._skip_evt.is_set() and next_seq < len(items):
-                    task = dl_tasks.get(next_seq)
-                    if task is not None and not task.done():
-                        task.cancel()
+                path = os.path.join(tempfile.gettempdir(), name)
                 try:
-                    idx, pkg, status = await asyncio.wait_for(ready.get(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    if not active_dl and not up_tasks and ready.empty() and not pending:
-                        break
-                    # keep the progress message alive while downloads/uploads
-                    # are still in flight, so the run never looks frozen
-                    if progress_cb is not None:
-                        await progress_cb(state_builder())
+                    if time.time() - os.path.getmtime(path) >= max_age:
+                        os.remove(path)
+                        removed += 1
+                except OSError:
                     continue
-                pending[idx] = (pkg, status)
-                # commit in strict source order (unless paused)
-                while next_seq in pending and not self._paused:
-                    pkg, status = pending.pop(next_seq)
-                    idx = next_seq
-                    next_seq += 1
-                    remaining -= 1
-                    item = items[idx]
-                    skipped = False
-                    if self._skip_evt.is_set():
-                        self._skip_evt.clear()
-                        self._skip_target = None
-                        skipped = True
-                    elif status == "cancelled":
-                        skipped = True
-                    if skipped:
-                        if pkg is not None:
-                            self._remove_temp_files(pkg)
-                        result.skipped += len(item["messages"])
-                        self._set_current(cfg, item)
-                        self._operation = "Skipping"
-                        if progress_cb is not None:
-                            await progress_cb(state_builder())
-                        continue
-                    if status == "ok" and pkg is not None and not self._stop.is_set():
-                        try:
-                            self._operation = "Uploading"
-                            await self._with_retries(
-                                client, cfg,
-                                lambda: self._upload_item(client, cfg, pkg, reply_map),
-                                skip_idx=idx, progress_cb=progress_cb,
-                                state_builder=state_builder,
-                            )
-                        except _SkipCurrent:
-                            self._skip_evt.clear()
-                            self._skip_target = None
-                            self._remove_temp_files(pkg)
-                            result.skipped += len(item["messages"])
-                        except _Abort:
-                            abort = True
-                            break
-                        except Exception as exc:  # noqa: BLE001
-                            log.warning("upload failed for group: %s", exc)
-                            result.failed += len(pkg["msgs"])
-                        else:
-                            sent = 0
-                            for m in pkg["msgs"]:
-                                if m.id in reply_map:
-                                    await db.mark_transferred(
-                                        cfg.source_entity.id, cfg.dest_entity.id,
-                                        m.id, cfg.sid, cfg.mode,
-                                    )
-                                    sent += 1
-                            result.success += sent
-                    if progress_cb is not None:
-                        await progress_cb(state_builder())
-                dispatch_more()
-        finally:
-            for task in list(dl_tasks.values()) + list(up_tasks):
-                task.cancel()
-            await asyncio.gather(
-                *(list(dl_tasks.values()) + list(up_tasks)), return_exceptions=True
-            )
-            cleanup_temp()
+        except OSError:
+            return 0
+        if removed:
+            log.info("Cleaned up %d stale temp file(s)", removed)
+        return removed
 
     # ------------------------------------------------------------------
     async def _wait_if_paused(self, progress_cb, state_builder) -> bool:
@@ -787,85 +589,41 @@ class TransferEngine:
             await asyncio.sleep(1.0)
         return True
 
-    async def _download_item(
-        self, client, cfg: TransferConfig, msgs: list, temp_paths: set[str],
-    ) -> dict | None:
-        """Download an item (single message or album) to temp files.
-
-        Returns a package dict for :meth:`_upload_item`, or None if there is
-        nothing uploadable.
-        """
-        text_only = "text_only" in cfg.options
-        media_only = "media_only" in cfg.options
-        drop_caption = "remove_captions" in cfg.options
-
-        if text_only:
-            payloads = [{"msg": m, "path": None, "text": m.text} for m in msgs if m.text]
-            if not payloads:
-                return None
-            return {"msgs": msgs, "kind": "text", "payloads": payloads, "caption": ""}
-
-        caption = "" if (drop_caption or media_only) else (msgs[0].text or "")
-        media_msgs = [
-            m for m in msgs
-            if m.media and not isinstance(m.media, types.MessageMediaWebPage)
-        ]
-        text_msgs = [
-            m for m in msgs
-            if not (m.media and not isinstance(m.media, types.MessageMediaWebPage)) and m.text
-        ]
-
-        payloads: list[dict] = []
-        if self._stop.is_set():
-            return None
-        if len(media_msgs) > 1:
-            paths = await asyncio.gather(
-                *(self._download_one(client, m, temp_paths) for m in media_msgs)
-            )
-            for m, path in zip(media_msgs, paths):
-                if path:
-                    payloads.append({"msg": m, "path": path, "text": None})
-        else:
-            for m in media_msgs:
-                path = await self._download_one(client, m, temp_paths)
-                if path:
-                    payloads.append({"msg": m, "path": path, "text": None})
-        for m in text_msgs:
-            payloads.append({"msg": m, "path": None, "text": m.text})
-        if not payloads:
-            return None
-        return {"msgs": msgs, "kind": "media", "payloads": payloads, "caption": caption}
 
     async def _download_one(self, client, msg, temp_paths: set[str]) -> str | None:
+        """Download one message's media to a temp file and verify it.
+
+        Returns the temp path on success, or ``None`` when the media is simply
+        unavailable. Any transport error (network / RPC / FloodWait) is
+        re-raised so :meth:`_with_retries` can retry the whole item; the temp
+        file is left registered in ``temp_paths`` and removed by the caller's
+        ``finally`` so nothing can linger in /tmp.
+        """
+        ext = _media_extension(msg)
+        tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
+        temp_paths.add(tmp_path)
+        self._file_dl = None
+        progress = self._file_progress_cb(
+            _msg_filename(msg) or f"message_{msg.id}", "Downloading", "dl"
+        )
         try:
-            ext = _media_extension(msg)
-            tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
-            temp_paths.add(tmp_path)
-            self._file_dl = None
-            progress = self._file_progress_cb(
-                _msg_filename(msg) or f"message_{msg.id}", "Downloading", "dl"
-            )
             path = await self._download_media(client, msg, tmp_path, progress)
-            if not path:
-                temp_paths.discard(tmp_path)
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-                return None
-            return path
-        except FloodWaitError:
-            raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("download failed for msg %s: %s", msg.id, exc)
-            temp_paths.discard(tmp_path)
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            raise
+        if not path:
+            log.warning("no media returned for msg %s", msg.id)
             return None
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size <= 0:
+            log.warning("download produced an empty file for msg %s", msg.id)
+            return None
+        return path
 
     async def _download_media(self, client, msg, tmp_path: str, progress) -> str | None:
         """Download one message's media, parallelising large documents."""
@@ -936,92 +694,6 @@ class TransferEngine:
         await asyncio.gather(*(asyncio.create_task(worker(i)) for i in range(n)))
         return dest_path
 
-    async def _upload_item(
-        self, client, cfg: TransferConfig, pkg: dict, reply_map: dict,
-    ) -> None:
-        # Temp files are only removed here on success. If an upload raises
-        # (e.g. FloodWait) the files are kept so _with_retries can retry, and
-        # any leftovers are cleaned up when the pipeline finishes.
-        if pkg["kind"] == "text":
-            for payload in pkg["payloads"]:
-                msg = payload["msg"]
-                reply_to = self._reply_to(msg, reply_map)
-                sent = await client.send_message(
-                    cfg.dest_entity,
-                    payload["text"],
-                    formatting_entities=msg.entities,
-                    parse_mode=None,
-                    reply_to=reply_to,
-                    silent=cfg.silent,
-                )
-                reply_map[msg.id] = sent.id
-            return
-
-        media_payloads = [p for p in pkg["payloads"] if p["path"]]
-        if len(media_payloads) > 1:
-            files = [p.get("file") or p["path"] for p in media_payloads]
-            sent = await client.send_file(
-                cfg.dest_entity,
-                files,
-                caption=pkg["caption"],
-                silent=cfg.silent,
-            )
-            if isinstance(sent, list) and len(sent) == len(media_payloads):
-                for payload, s in zip(media_payloads, sent):
-                    reply_map[payload["msg"].id] = s.id
-            else:
-                for payload in media_payloads:
-                    reply_map[payload["msg"].id] = sent.id
-            for payload in pkg["payloads"]:
-                if payload["path"] or not payload["text"]:
-                    continue
-                msg = payload["msg"]
-                reply_to = self._reply_to(msg, reply_map)
-                s = await client.send_message(
-                    cfg.dest_entity,
-                    payload["text"],
-                    formatting_entities=msg.entities,
-                    parse_mode=None,
-                    reply_to=reply_to,
-                    silent=cfg.silent,
-                )
-                reply_map[msg.id] = s.id
-        else:
-            for payload in pkg["payloads"]:
-                msg = payload["msg"]
-                reply_to = self._reply_to(msg, reply_map)
-                if payload["path"]:
-                    sent = await client.send_file(
-                        cfg.dest_entity,
-                        payload.get("file") or payload["path"],
-                        caption=pkg["caption"],
-                        formatting_entities=msg.entities,
-                        parse_mode=None,
-                        reply_to=reply_to,
-                        silent=cfg.silent,
-                    )
-                    reply_map[msg.id] = sent.id
-                elif payload["text"]:
-                    sent = await client.send_message(
-                        cfg.dest_entity,
-                        payload["text"],
-                        formatting_entities=msg.entities,
-                        parse_mode=None,
-                        reply_to=reply_to,
-                        silent=cfg.silent,
-                    )
-                    reply_map[msg.id] = sent.id
-        self._remove_temp_files(pkg)
-
-    @staticmethod
-    def _remove_temp_files(pkg: dict) -> None:
-        for payload in pkg["payloads"]:
-            path = payload.get("path")
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
 
     @staticmethod
     def _reply_to(msg, reply_map: dict) -> int | None:
@@ -1277,6 +949,17 @@ class TransferEngine:
         return None
 
     async def _download_transfer(self, client, cfg, msgs: list, reply_map: dict) -> None:
+        """Strictly sequential download & re-upload of a single item.
+
+        Lifecycle per file: download -> verify -> upload -> delete, one file
+        at a time, so at most one download and one upload is ever active.
+        Albums are downloaded file-by-file then re-grouped into a single
+        ``send_file`` album. The ``finally`` guarantees every temp file is
+        removed on *every* path (success, retry, skip, stop), so /tmp can
+        never accumulate. Exceptions are intentionally not swallowed here:
+        :meth:`_with_retries` retries the whole item, then the run counts it
+        as failed instead of silently dropping a file.
+        """
         text_only = "text_only" in cfg.options
         media_only = "media_only" in cfg.options
         drop_caption = "remove_captions" in cfg.options
@@ -1286,28 +969,22 @@ class TransferEngine:
                 text = m.text
                 if not text:
                     continue
-                reply_to = None
-                if m.reply_to and m.reply_to.reply_to_msg_id:
-                    reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
                 sent = await client.send_message(
                     cfg.dest_entity,
                     text,
                     formatting_entities=m.entities,
                     parse_mode=None,
-                    reply_to=reply_to,
+                    reply_to=self._reply_to(m, reply_map),
                     silent=cfg.silent,
                 )
                 reply_map[m.id] = sent.id
             return
 
         is_album = len(msgs) > 1
-        if media_only:
-            caption = ""
-        else:
-            caption = "" if drop_caption else (msgs[0].text or "")
+        caption = "" if (media_only or drop_caption) else (msgs[0].text or "")
 
-        media_msgs = []
-        text_msgs = []
+        media_msgs: list = []
+        text_msgs: list = []
         for m in msgs:
             media = m.media
             is_webpage = isinstance(media, types.MessageMediaWebPage)
@@ -1316,95 +993,69 @@ class TransferEngine:
             elif m.text:
                 text_msgs.append(m)
 
-        if media_msgs:
-            try:
+        temp_paths: set[str] = set()
+        try:
+            if media_msgs:
                 if is_album:
-                    paths = []
+                    pairs: list = []
                     for m in media_msgs:
-                        ext = _media_extension(m)
-                        tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
-                        self._file_dl = None
-                        path = await client.download_media(
-                            m,
-                            file=tmp_path,
-                            progress_callback=self._file_progress_cb(
-                                _msg_filename(m) or f"message_{m.id}", "Downloading", "dl"
-                            ),
-                        )
+                        path = await self._download_one(client, m, temp_paths)
                         if path:
-                            paths.append(path)
-                    if paths:
+                            pairs.append((m, path))
+                    if pairs:
+                        log.info(
+                            "uploading album of %d file(s) to %s",
+                            len(pairs), cfg.dest_name or cfg.dest_entity.id,
+                        )
                         sent = await client.send_file(
                             cfg.dest_entity,
-                            paths,
+                            [p for _, p in pairs],
                             caption=caption,
                             silent=cfg.silent,
                         )
-                        if isinstance(sent, list) and len(sent) == len(paths):
-                            for m, s in zip(media_msgs, sent):
+                        if isinstance(sent, list) and len(sent) == len(pairs):
+                            for (m, _), s in zip(pairs, sent):
                                 reply_map[m.id] = s.id
                         else:
-                            for m in media_msgs:
+                            for m, _ in pairs:
                                 reply_map[m.id] = sent.id
-                        for p in paths:
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
                 else:
                     for m in media_msgs:
-                        ext = _media_extension(m)
-                        tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
-                        path = None
-                        try:
-                            self._file_dl = None
-                            path = await client.download_media(
-                                m,
-                                file=tmp_path,
-                                progress_callback=self._file_progress_cb(
-                                    _msg_filename(m) or f"message_{m.id}", "Downloading", "dl"
-                                ),
-                            )
-                            if path:
-                                reply_to = None
-                                if m.reply_to and m.reply_to.reply_to_msg_id:
-                                    reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
-                                sent = await client.send_file(
-                                    cfg.dest_entity,
-                                    path,
-                                    caption=caption,
-                                    formatting_entities=m.entities,
-                                    parse_mode=None,
-                                    reply_to=reply_to,
-                                    silent=cfg.silent,
-                                )
-                                reply_map[m.id] = sent.id
-                        except Exception as exc:
-                            log.warning("download/upload failed for msg %s: %s", m.id, exc)
-                        finally:
-                            if path and os.path.exists(path):
-                                try:
-                                    os.remove(path)
-                                except OSError:
-                                    pass
-            except Exception as exc:
-                log.warning("album download/upload failed: %s", exc)
+                        path = await self._download_one(client, m, temp_paths)
+                        if not path:
+                            continue
+                        sent = await client.send_file(
+                            cfg.dest_entity,
+                            path,
+                            caption=caption,
+                            formatting_entities=m.entities,
+                            parse_mode=None,
+                            reply_to=self._reply_to(m, reply_map),
+                            silent=cfg.silent,
+                        )
+                        reply_map[m.id] = sent.id
+                        log.info(
+                            "item msg=%d downloaded+uploaded (%.1f MB)",
+                            m.id, os.path.getsize(path) / (1024 * 1024),
+                        )
+            for m in text_msgs:
+                sent = await client.send_message(
+                    cfg.dest_entity,
+                    m.text,
+                    formatting_entities=m.entities,
+                    parse_mode=None,
+                    reply_to=self._reply_to(m, reply_map),
+                    silent=cfg.silent,
+                )
+                reply_map[m.id] = sent.id
+        finally:
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            temp_paths.clear()
 
-        for m in text_msgs:
-            if m in media_msgs:
-                continue
-            reply_to = None
-            if m.reply_to and m.reply_to.reply_to_msg_id:
-                reply_to = reply_map.get(m.reply_to.reply_to_msg_id)
-            sent = await client.send_message(
-                cfg.dest_entity,
-                m.text,
-                formatting_entities=m.entities,
-                parse_mode=None,
-                reply_to=reply_to,
-                silent=cfg.silent,
-            )
-            reply_map[m.id] = sent.id
 
 
 def _verb(mode: str) -> str:
