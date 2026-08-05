@@ -170,28 +170,23 @@ async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> li
     from telethon.tl.types import Channel, Chat
 
     dialogs = []
-    try:
-        async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT):
-            async for dialog in client.iter_dialogs(limit=limit):
-                try:
-                    entity = dialog.entity
-                except Exception as exc:
-                    log.debug("dialog entity fetch failed: %s", exc)
-                    continue
-                if not isinstance(entity, (Channel, Chat)):
-                    continue
-                if isinstance(entity, Channel):
-                    if entity.broadcast:
-                        if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                            continue
-                    elif getattr(entity, "read_only", False):
-                        if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                            continue
-                dialogs.append({"id": entity.id, "title": dialog.name or str(entity.id)})
-    except asyncio.TimeoutError:
-        log.warning("fetch_sendable_dialogs timed out after %ss", config.FETCH_DIALOGS_TIMEOUT)
-    except Exception as exc:
-        log.warning("fetch_sendable_dialogs failed: %s", exc)
+    async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT):
+        async for dialog in client.iter_dialogs(limit=limit):
+            try:
+                entity = dialog.entity
+            except Exception as exc:
+                log.debug("dialog entity fetch failed: %s", exc)
+                continue
+            if not isinstance(entity, (Channel, Chat)):
+                continue
+            if isinstance(entity, Channel):
+                if entity.broadcast:
+                    if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
+                        continue
+                elif getattr(entity, "read_only", False):
+                    if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
+                        continue
+            dialogs.append({"id": entity.id, "title": dialog.name or str(entity.id)})
     seen: set[int] = set()
     unique = []
     for d in dialogs:

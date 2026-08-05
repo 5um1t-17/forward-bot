@@ -962,9 +962,11 @@ class TransferEngine:
             if isinstance(sent, list) and len(sent) == len(media_payloads):
                 for payload, s in zip(media_payloads, sent):
                     reply_map[payload["msg"].id] = s.id
-            else:
+            elif hasattr(sent, "id"):
                 for payload in media_payloads:
                     reply_map[payload["msg"].id] = sent.id
+            else:
+                log.warning("Unexpected send_file result type: %s", type(sent))
             for payload in pkg["payloads"]:
                 if payload["path"] or not payload["text"]:
                     continue

@@ -168,19 +168,31 @@ async def _ask_dest(bot, event, uid: int) -> bool:
     wiz = store.get_transfer(uid)
     store.set_pending(uid, None)
     wiz.dest_page = 0
-    await edit(event, "⏳ Loading destination chats...", None)
+    try:
+        await event.edit("⏳ Loading destination chats...", buttons=None, parse_mode="html")
+    except Exception:
+        await event.respond("⏳ Loading destination chats...", parse_mode="html")
     try:
         sid = await db.get_active_sid(uid)
         client = await client_pool.get(uid, sid)
         wiz.dialogs = await fetch_sendable_dialogs(client, limit=100)
     except Exception as exc:
         log.warning("dialogs failed: %s", exc)
-        await edit(event, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.back_row())
+        try:
+            await event.edit(f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", buttons=keyboards.back_row(), parse_mode="html")
+        except Exception:
+            await event.respond(f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", buttons=keyboards.back_row(), parse_mode="html")
         return True
     if not wiz.dialogs:
-        await edit(event, "⚠️ No groups/channels found where you can post.", keyboards.back_row())
+        try:
+            await event.edit("⚠️ No groups/channels found where you can post.", buttons=keyboards.back_row(), parse_mode="html")
+        except Exception:
+            await event.respond("⚠️ No groups/channels found where you can post.", buttons=keyboards.back_row(), parse_mode="html")
         return True
-    await edit(event, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
+    try:
+        await event.edit(text.dest_prompt(), buttons=keyboards.dest_keyboard(wiz.dialogs, 0), parse_mode="html")
+    except Exception:
+        await event.respond(text.dest_prompt(), buttons=keyboards.dest_keyboard(wiz.dialogs, 0), parse_mode="html")
     return True
 
 

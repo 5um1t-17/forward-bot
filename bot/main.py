@@ -98,14 +98,16 @@ def register_handlers(bot: TelegramClient) -> None:
                 return
             store.set_pending(uid, None)
 
-        if event.message.forward is not None:
-            # allow forwarded-message resolution even without a pending step
-            await transfer.handle_pending(bot, event, "tr_source")
-        elif raw:
-            user = await db.get_user(uid)
-            await bot.send_message(uid, text.menu_text(user), buttons=keyboards.main_menu(), parse_mode="html")
-        else:
-            await bot.send_message(uid, text.menu_text(await db.get_user(uid)), buttons=keyboards.main_menu(), parse_mode="html")
+        try:
+            if event.message.forward is not None:
+                await transfer.handle_pending(bot, event, "tr_source")
+            elif raw:
+                user = await db.get_user(uid)
+                await bot.send_message(uid, text.menu_text(user), buttons=keyboards.main_menu(), parse_mode="html")
+            else:
+                await bot.send_message(uid, text.menu_text(await db.get_user(uid)), buttons=keyboards.main_menu(), parse_mode="html")
+        except Exception:
+            log.exception("message handler fallback error for uid=%s", uid)
 
     @bot.on(events.CallbackQuery())
     async def on_callback(event: events.CallbackQuery.Event) -> None:

@@ -5,6 +5,7 @@ import logging
 
 from telethon import Button, events
 from telethon.errors import (
+    FloodWaitError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     SessionPasswordNeededError,
@@ -137,13 +138,54 @@ async def _on_phone(bot, event, uid: int) -> bool:
         state = LoginState(phone=phone, code_hash=result.phone_code_hash, client=client, step="code")
         store.login[uid] = state
         store.set_pending(uid, "login_code")
-        await event.respond(text.add_account_step2())
+        sent_type = type(result.type).__name__
+        timeout = getattr(result, "next_code_timeout", 0) or 0
+        registered = getattr(result, "phone_registered", None)
+        log.info(
+            "send_code_request ok: phone=%s via=%s registered=%s next_code_timeout=%ss",
+            phone, sent_type, registered, timeout,
+        )
+        await event.respond(
+            text.add_account_step2() + _code_delivery_hint(sent_type, timeout),
+            parse_mode="html",
+        )
     except PhoneNumberInvalidError:
         await event.respond("⚠️ That phone number is not valid. Try again.")
+    except FloodWaitError as exc:
+        log.warning("send_code_request flood: %s", exc)
+        await event.respond(
+            f"⚠️ Telegram is rate-limiting code requests.\n\n"
+            f"Wait <b>{exc.seconds}</b> seconds before trying again — retrying resets the timer.",
+            parse_mode="html",
+        )
     except Exception as exc:
         log.warning("send_code_request failed: %s", exc)
         await event.respond(f"⚠️ Could not request the code: {str(exc)[:200]}\n\nTry again.")
     return True
+
+
+def _code_delivery_hint(sent_type: str, timeout: int) -> str:
+    hints = {
+        "SentCodeTypeSms": "\n\n📱 Telegram says the code was sent <b>via SMS</b>.\nCheck your SMS (also spam/junk).",
+        "SentCodeTypeApp": (
+            "\n\n📲 Telegram sent the code <b>inside the Telegram app</b> of this number — "
+            "an SMS will NOT be sent.\n"
+            "Open the Telegram app on the device where <b>this number is logged in</b> and look for a "
+            "\"Login code\" notification or card (it may say \"Code: XXXXX\").\n"
+            "If you don't have access to a device where this number is logged in, you cannot add this account."
+        ),
+        "SentCodeTypeCall": "\n\n📞 Telegram says the code was sent <b>via a phone call</b>.\nAnswer the call and note the code.",
+        "SentCodeTypeFlashCall": "\n\n📞 Telegram says the code was sent <b>via a flash call</b>.\nCheck missed calls for the last digits of the caller number.",
+    }
+    hint = hints.get(sent_type)
+    if not hint:
+        hint = "\n\n📨 Check your Telegram app and SMS for the login code."
+    if timeout and timeout > 0:
+        hint += (
+            f"\n\n⏳ Wait at least <b>{timeout}</b> seconds before retrying this number — "
+            f"each retry resets the timer and suppresses delivery."
+        )
+    return hint
 
 
 async def _on_code(bot, event, uid: int) -> bool:
@@ -160,12 +202,32 @@ async def _on_code(bot, event, uid: int) -> bool:
         await event.respond(text.add_account_step3())
         return True
     except PhoneCodeInvalidError:
-        await event.respond("⚠️ Invalid code. Check and try again.")
-        return True
-    except PhoneCodeExpiredError:
-        await event.respond("⚠️ The code has expired. Restart with /start → Accounts → Add.")
+        await event.respond("⚠️ Invalid code. Check and try again.", parse_mode="html")
         store.login.pop(uid, None)
         store.set_pending(uid, None)
+        try:
+            await state.client.disconnect()
+        except Exception:
+            pass
+        return True
+    except PhoneCodeExpiredError:
+        await event.respond("⚠️ The code has expired. Restart with /start → Accounts → Add.", parse_mode="html")
+        store.login.pop(uid, None)
+        store.set_pending(uid, None)
+        try:
+            await state.client.disconnect()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        log.warning("sign_in failed: %s", exc)
+        await event.respond("⚠️ Sign-in failed. Try again or restart with /start → Accounts → Add.", parse_mode="html")
+        store.login.pop(uid, None)
+        store.set_pending(uid, None)
+        try:
+            await state.client.disconnect()
+        except Exception:
+            pass
         return True
     await _finalize_login(bot, event, uid, state)
     return True
@@ -180,7 +242,13 @@ async def _on_password(bot, event, uid: int) -> bool:
         await state.client.sign_in(password=event.raw_text)
     except Exception as exc:
         log.warning("2FA sign-in failed: %s", exc)
-        await event.respond("⚠️ Wrong password. Try again.")
+        await event.respond("⚠️ Wrong password. Try again.", parse_mode="html")
+        store.login.pop(uid, None)
+        store.set_pending(uid, None)
+        try:
+            await state.client.disconnect()
+        except Exception:
+            pass
         return True
     await _finalize_login(bot, event, uid, state)
     return True
