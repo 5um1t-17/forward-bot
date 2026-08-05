@@ -134,13 +134,17 @@ async def _on_phone(bot, event, uid: int) -> bool:
     try:
         client = session_manager.build_client()
         await client.connect()
-        result = await client.send_code_request(phone, force_sms=True)
+        result = await client.send_code_request(phone)
         state = LoginState(phone=phone, code_hash=result.phone_code_hash, client=client, step="code")
         store.login[uid] = state
         store.set_pending(uid, "login_code")
         sent_type = type(result.type).__name__
         timeout = getattr(result, "next_code_timeout", 0) or 0
-        log.info("send_code_request ok: phone=%s via=%s (forced SMS) next_code_timeout=%ss", phone, sent_type, timeout)
+        registered = getattr(result, "phone_registered", None)
+        log.info(
+            "send_code_request ok: phone=%s via=%s registered=%s next_code_timeout=%ss",
+            phone, sent_type, registered, timeout,
+        )
         await event.respond(text.add_account_step2() + _code_delivery_hint(sent_type, timeout))
     except PhoneNumberInvalidError:
         await event.respond("⚠️ That phone number is not valid. Try again.")
@@ -158,8 +162,14 @@ async def _on_phone(bot, event, uid: int) -> bool:
 
 def _code_delivery_hint(sent_type: str, timeout: int) -> str:
     hints = {
-        "SentCodeTypeSms": "\n\n📱 Telegram says the code was sent <b>via SMS</b>.",
-        "SentCodeTypeApp": "\n\n📲 Telegram says the code was sent <b>inside the Telegram app</b> of this number.\nCheck that app, NOT SMS.",
+        "SentCodeTypeSms": "\n\n📱 Telegram says the code was sent <b>via SMS</b>.\nCheck your SMS (also spam/junk).",
+        "SentCodeTypeApp": (
+            "\n\n📲 Telegram sent the code <b>inside the Telegram app</b> of this number — "
+            "an SMS will NOT be sent.\n"
+            "Open the Telegram app on the device where <b>this number is logged in</b> and look for a "
+            "\"Login code\" notification or card (it may say \"Code: XXXXX\").\n"
+            "If you don't have access to a device where this number is logged in, you cannot add this account."
+        ),
         "SentCodeTypeCall": "\n\n📞 Telegram says the code was sent <b>via a phone call</b>.\nAnswer the call and note the code.",
         "SentCodeTypeFlashCall": "\n\n📞 Telegram says the code was sent <b>via a flash call</b>.\nCheck missed calls for the last digits of the caller number.",
     }
