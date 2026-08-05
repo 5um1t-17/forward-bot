@@ -134,13 +134,13 @@ async def _on_phone(bot, event, uid: int) -> bool:
     try:
         client = session_manager.build_client()
         await client.connect()
-        result = await client.send_code_request(phone)
+        result = await client.send_code_request(phone, force_sms=True)
         state = LoginState(phone=phone, code_hash=result.phone_code_hash, client=client, step="code")
         store.login[uid] = state
         store.set_pending(uid, "login_code")
         sent_type = type(result.type).__name__
         timeout = getattr(result, "next_code_timeout", 0) or 0
-        log.info("send_code_request ok: phone=%s via=%s next_code_timeout=%ss", phone, sent_type, timeout)
+        log.info("send_code_request ok: phone=%s via=%s (forced SMS) next_code_timeout=%ss", phone, sent_type, timeout)
         await event.respond(text.add_account_step2() + _code_delivery_hint(sent_type, timeout))
     except PhoneNumberInvalidError:
         await event.respond("⚠️ That phone number is not valid. Try again.")
