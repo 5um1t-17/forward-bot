@@ -5,6 +5,7 @@ import logging
 
 from telethon import Button, events
 from telethon.errors import (
+    FloodWaitError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     SessionPasswordNeededError,
@@ -137,13 +138,38 @@ async def _on_phone(bot, event, uid: int) -> bool:
         state = LoginState(phone=phone, code_hash=result.phone_code_hash, client=client, step="code")
         store.login[uid] = state
         store.set_pending(uid, "login_code")
-        await event.respond(text.add_account_step2())
+        sent_type = type(result.type).__name__
+        timeout = getattr(result, "next_code_timeout", 0) or 0
+        log.info("send_code_request ok: phone=%s via=%s next_code_timeout=%ss", phone, sent_type, timeout)
+        await event.respond(text.add_account_step2() + _code_delivery_hint(sent_type, timeout))
     except PhoneNumberInvalidError:
         await event.respond("⚠️ That phone number is not valid. Try again.")
+    except FloodWaitError as exc:
+        log.warning("send_code_request flood: %s", exc)
+        await event.respond(
+            f"⚠️ Telegram is rate-limiting code requests.\n\n"
+            f"Wait <b>{exc.seconds}</b> seconds before trying again — retrying resets the timer."
+        )
     except Exception as exc:
         log.warning("send_code_request failed: %s", exc)
         await event.respond(f"⚠️ Could not request the code: {str(exc)[:200]}\n\nTry again.")
     return True
+
+
+def _code_delivery_hint(sent_type: str, timeout: int) -> str:
+    hints = {
+        "SentCodeTypeSms": "\n\n📱 Telegram says the code was sent <b>via SMS</b>.",
+        "SentCodeTypeApp": "\n\n📲 Telegram says the code was sent <b>inside the Telegram app</b> of this number.\nCheck that app, NOT SMS.",
+        "SentCodeTypeCall": "\n\n📞 Telegram says the code was sent <b>via a phone call</b>.\nAnswer the call and note the code.",
+        "SentCodeTypeFlashCall": "\n\n📞 Telegram says the code was sent <b>via a flash call</b>.\nCheck missed calls for the last digits of the caller number.",
+    }
+    hint = hints.get(sent_type, "")
+    if timeout and timeout > 0:
+        hint += (
+            f"\n\n⏳ Wait at least <b>{timeout}</b> seconds before retrying this number — "
+            f"each retry resets the timer and suppresses delivery."
+        )
+    return hint
 
 
 async def _on_code(bot, event, uid: int) -> bool:
