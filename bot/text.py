@@ -304,6 +304,23 @@ def _bar2(fraction: float, width: int = 10) -> str:
     return "▰" * filled + "▱" * (width - filled)
 
 
+def _type_icon(ctype: str) -> str:
+    t = (ctype or "").lower()
+    if "album" in t:
+        return "🎬"
+    if "photo" in t or "image" in t:
+        return "🖼"
+    if "video" in t:
+        return "🎬"
+    if "audio" in t or "voice" in t:
+        return "🎵"
+    if "sticker" in t:
+        return "🧩"
+    if "gif" in t:
+        return "🎞"
+    return "📄"
+
+
 def _fmt_bps(n: float) -> str:
     return f"{_fmt_size(n)}/s"
 
@@ -338,11 +355,15 @@ def _file_block(icon: str, label: str, fdata: dict, bar_fn, width: int) -> list[
     frac = done / total if total else 0.0
     speed = fdata.get("speed", 0.0)
     eta = fdata.get("eta", 0.0)
+    fname = (fdata.get("filename") or "").strip()
+    header = f"{icon} <b>{label}</b>"
+    if fname:
+        header += f" · <i>{_escape(fname[:44])}</i>"
     size_line = f"{_fmt_size(done)} / {_fmt_size(total)}"
     if speed > 0:
-        size_line += f" • ⚡{_fmt_bps(speed)}"
+        size_line += f" · ⚡{_fmt_bps(speed)}"
     lines = [
-        f"{icon} <b>{label}</b>",
+        header,
         f"<code>{bar_fn(frac, width)}</code> <b>{frac * 100:.0f}%</b>",
         size_line,
     ]
@@ -359,6 +380,9 @@ def progress_text(state: dict) -> str:
     failed = state.get("failed", 0)
     total = state.get("total", 0)
     done = success + skipped + failed
+    speed = state.get("speed", 0.0)
+    elapsed = state.get("elapsed", 0.0)
+    eta = state.get("eta", 0.0)
     current = state.get("current")
     dl = state.get("file_dl")
     up = state.get("file_up")
@@ -376,18 +400,19 @@ def progress_text(state: dict) -> str:
     fraction = done / total if total else 0.0
     lines.append(f"<code>{_bar(fraction, 14)}</code> <b>{fraction * 100:.0f}%</b> • <b>{done}</b>/{total}")
     lines.append(f"✅ {success}  ⏭ {skipped}  ❌ {failed}")
+    lines.append(f"⚡ {speed:.1f} msg/s • ⏱ {_fmt_compact(elapsed)} • ⌛ {_fmt_compact(eta)}")
     lines.append("")
 
     lines.append("📄 <b>Current</b>")
     if current:
         ctype = str(current.get("type") or "Message")
         if ctype.startswith("Album ·"):
-            ctype = f"Album ({ctype.split('·', 1)[1].strip()})"
+            ctype = f"Album ({ctype.split('·', 1)[1].strip()} files)"
         msg_id = current.get("msg_id")
+        head = f"{_type_icon(ctype)} {_escape(ctype)}"
         if msg_id is not None:
-            lines.append(f"📄 #{msg_id} • {_escape(ctype)}")
-        else:
-            lines.append(f"📄 {_escape(ctype)}")
+            head += f" • #<code>{msg_id}</code>"
+        lines.append(head)
         link = (current.get("link") or "").replace("https://", "").replace("http://", "")
         if link:
             lines.append(f"🔗 <code>{_escape(link)}</code>")
@@ -407,7 +432,7 @@ def progress_text(state: dict) -> str:
 
     lines.append(f"📍 {_escape(source)} ➜ {_escape(dest)}")
     if flood is not None and flood > 0:
-        lines.append(f"⏳ Rate limit: waiting <code>{int(flood)}s</code>")
+        lines.append(f"⏳ Rate limit: waiting <code>{int(flood)}s</code> — resumes automatically")
 
     lines.append("")
     lines.append(bottom)
