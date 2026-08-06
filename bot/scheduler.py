@@ -121,7 +121,18 @@ class Scheduler:
                 "status": "running",
             }
             log_id = await db.add_log(log_doc)
-            result = await engine.run(client, cfg)
+
+            async def refresh_client():
+                # Rebuild the account client after repeated network errors so a
+                # scheduled run self-heals instead of retrying forever against a
+                # half-dead connection.
+                try:
+                    return await client_pool.refresh(user_id, sid)
+                except Exception as exc:
+                    log.warning("client refresh failed for user %s: %s", user_id, exc)
+                    return None
+
+            result = await engine.run(client, cfg, refresh_client=refresh_client)
             await db.update_log(
                 log_id,
                 {
@@ -143,8 +154,12 @@ class Scheduler:
     async def _build_cfg(self, job: dict, client, engine: TransferEngine) -> TransferConfig:
         src = job["source"]
         dst = job["dest"]
-        source_entity = await client.get_entity(src["id"])
-        dest_entity = await client.get_entity(dst["id"])
+        source_entity = await asyncio.wait_for(
+            client.get_entity(src["id"]), timeout=config.OP_TIMEOUT
+        )
+        dest_entity = await asyncio.wait_for(
+            client.get_entity(dst["id"]), timeout=config.OP_TIMEOUT
+        )
         count_mode = job.get("count_mode", "latest")
         if count_mode == "latest":
             ids = await engine.collect_ids(

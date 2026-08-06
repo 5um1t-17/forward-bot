@@ -8,6 +8,7 @@ os.environ.setdefault("BOT_TOKEN", "x")
 
 from telethon.tl import types  # noqa: E402
 
+from bot.client_pool import client_pool  # noqa: E402
 from bot.db import db  # noqa: E402
 from bot.scheduler import Scheduler, _compute_next, schedule_instant  # noqa: E402
 from bot.transfer_engine import TransferEngine  # noqa: E402
@@ -84,13 +85,13 @@ async def main():
     await db.init()
     await db.set_setting(1, "notifications", True)
 
-    # fake the account client builder
+    # fake the account client pool (the scheduler builds clients via the pool)
     scheduler = Scheduler(FakeBot(), TransferEngine())
 
-    async def fake_build_client(uid, sid):
+    async def fake_get(user_id, sid):
         return FakeClient()
 
-    scheduler._build_client = fake_build_client
+    client_pool.get = fake_get
 
     job = {
         "user_id": 1,

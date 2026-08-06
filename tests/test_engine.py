@@ -416,6 +416,122 @@ async def test_download_progress_ticks():
     print("download progress ticks OK")
 
 
+async def test_pause_interrupts_download():
+    """Pausing mid-download must interrupt the current transfer immediately
+    (op cancellation) and Resume must retry the same item, losing no progress."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [_media_msg(1), _media_msg(2)]
+    client = DownloadClient(msgs, delays={1: 2.0})
+    eng = TransferEngine()
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2],
+                         mode="download", threads=2, dedup=False, sid="abc")
+
+    interrupted = {"downloads": 0}
+
+    orig_dl = client.download_media
+
+    async def tracking_download(msg, file=None, progress_callback=None):
+        interrupted["downloads"] += 1
+        return await orig_dl(msg, file=file, progress_callback=progress_callback)
+
+    client.download_media = tracking_download
+
+    async def pauser():
+        await asyncio.sleep(0.3)
+        eng.request_pause()
+        await asyncio.sleep(0.4)
+        eng.request_resume()
+
+    pause_task = asyncio.create_task(pauser())
+    result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+    await pause_task
+    assert result.success == 2 and result.failed == 0, result
+    # msg 1 was interrupted and restarted on resume (>=2 download attempts)
+    assert interrupted["downloads"] >= 3, interrupted["downloads"]
+    print("pause interrupts download + resume retries item OK")
+
+
+async def test_item_retry_deadline_caps_unlimited():
+    """With retry_count=0 (the UI's 'Unlimited'), a persistently failing item
+    must still be abandoned once the per-item deadline is reached, so the
+    queue always makes forward progress."""
+    import bot.config as bconfig
+    old_deadline = bconfig.config.MAX_ITEM_RETRY_SECONDS
+    bconfig.config.MAX_ITEM_RETRY_SECONDS = 0.3
+    try:
+        src = FakeEntity(1)
+        dst = FakeEntity(2)
+        msgs = [FakeMessage(i, text=f"m{i}") for i in range(1, 4)]
+
+        class FailingClient(FakeClient):
+            async def forward_messages(self, dest, ids, from_peer=None, **kw):
+                await asyncio.sleep(0.05)
+                raise ConnectionError("boom")
+
+        client = FailingClient(msgs)
+        eng = TransferEngine()
+        cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2, 3],
+                             mode="forward", options={"keep_sender"}, threads=1,
+                             retry_count=0, auto_resume=True, dedup=False, sid="abc")
+        result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+        assert result.total == 3 and result.success == 0 and result.failed == 0, result
+        assert result.skipped == 3, result  # deadline abandons each item
+        print("item retry deadline caps Unlimited retries OK")
+    finally:
+        bconfig.config.MAX_ITEM_RETRY_SECONDS = old_deadline
+
+
+async def test_stall_watchdog_cancels_frozen_download():
+    """A download that reports one progress tick and then stops must be
+    cancelled by the stall watchdog (not hang forever) and count as failed."""
+    import bot.config as bconfig
+    old_stall = bconfig.config.STALL_TIMEOUT
+    bconfig.config.STALL_TIMEOUT = 0.3
+    try:
+        src = FakeEntity(1)
+        dst = FakeEntity(2)
+        msgs = [_media_msg(1)]
+
+        class StallingClient(FakeClient):
+            async def download_media(self, msg, file=None, progress_callback=None):
+                if progress_callback:
+                    progress_callback(0, 100)
+                await asyncio.sleep(60)  # frozen mid-download
+
+        client = StallingClient(msgs)
+        eng = TransferEngine()
+        cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1],
+                             mode="download", threads=2, retry_count=1,
+                             dedup=False, sid="abc")
+        result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+        assert result.success == 0 and result.failed == 1, result
+        print("stall watchdog cancels frozen download OK")
+    finally:
+        bconfig.config.STALL_TIMEOUT = old_stall
+
+
+async def test_fetch_failure_accounted_not_hung():
+    """A chunk fetch that keeps failing must be counted as failed and the run
+    must complete instead of hanging or crashing."""
+    src = FakeEntity(1)
+    dst = FakeEntity(2)
+    msgs = [_media_msg(i) for i in range(1, 6)]
+
+    class FlakyClient(FakeClient):
+        async def get_messages(self, source, ids=None):
+            raise ConnectionError("boom")
+
+    client = FlakyClient(msgs)
+    eng = TransferEngine()
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1, 2, 3, 4, 5],
+                         mode="forward", options={"keep_sender"}, threads=1,
+                         dedup=False, sid="abc")
+    result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+    assert result.failed == 5 and result.success == 0, result
+    print("fetch failure accounted, run completed OK")
+
+
 async def main():
     test_parse_input()
     test_filter()
@@ -430,6 +546,10 @@ async def main():
     await test_download_pipeline_stop()
     await test_download_flood_cap()
     await test_download_progress_ticks()
+    await test_pause_interrupts_download()
+    await test_item_retry_deadline_caps_unlimited()
+    await test_stall_watchdog_cancels_frozen_download()
+    await test_fetch_failure_accounted_not_hung()
     print("ALL TESTS PASSED")
 
 

@@ -1,57 +1,115 @@
-# Stability Audit & Engine Refactor Report
+# Production-Grade Audit — Telegram Transfer Bot
 
-Audit scope: `bot/transfer_engine.py`, `bot/client_pool.py`, `bot/session_manager.py`,
-`bot/scheduler.py`, `bot/main.py`, and the test suite. All 17 tests pass
-(`PYTHONPATH=. python3 -m pytest tests/ -q -p asyncio --asyncio-mode=auto`).
+Audit date: 2026-08-06
+Scope: whole `bot/` package + `web.py` + `run.sh` + tests.
 
-## 1. Findings & fixes by file
+The bot runs on Render. Workload target: ~2000 media/day, ~10 GB download and
+~10 GB upload per day, 24/7.
 
-### `bot/transfer_engine.py` (engine)
-| # | Finding | Fix |
-|---|---------|-----|
-| 1 | **Two divergent run paths.** `run()` dispatched `mode == "download"` to `_run_download_pipeline` and every other mode to a serial loop. The pipeline ran up to `threads * DOWNLOAD_MULT` downloads **and** up to `threads * UPLOAD_MULT` pre-uploads concurrently — i.e. many simultaneous downloads/uploads overlapping, exactly the "overlap accumulation" the 24/7 spec forbids. | Removed `_run_download_pipeline`, `_download_item`, `_upload_item`, `_remove_temp_files` (about 240 lines). All modes now run through **one strict sequential loop**: one item at a time, one download → verify → upload → delete → next. |
-| 2 | **`_download_transfer` swallowed every exception** (lines 1382/1390 `except Exception: log.warning(...)`), so FloodWait/timeout/network failures were logged but **never retried** by `_with_retries` and files were silently dropped. | Rewrote it as a strict serial worker that does **not** swallow exceptions — `_with_retries` (already wrapping the item) now retries the whole item; after retries are exhausted the run counts it as failed. Only genuinely-unavailable media (`download_media` returns `None`) is skipped. |
-| 3 | **Album temp files leaked on `send_file` failure.** In the old album branch, files were removed only *after* a successful `send_file`; a failure mid-album left partial files in `/tmp`. | Every downloaded path is registered in a `temp_paths` set; a `finally` removes **all** of them on every exit path (success, retry, skip, stop, exception). |
-| 4 | **Partial-file leak on download error.** `_download_one` kept a `fwd_*` file on disk if `client.download_media` raised mid-write (the `path` var stayed `None`, so the `finally` skipped it). | The temp path is now created and registered **before** the download; the caller's `finally` removes it regardless of outcome. |
-| 5 | **No verification step.** A download could return an empty/partial path and still be "uploaded". | Added a verify step: `os.path.getsize(path) > 0` check after download; empty files are discarded (logged). |
-| 6 | **Slow single file = frozen UI.** The old serial loop only pushed progress *between* items, so a large file's download looked frozen (and `test_download_progress_ticks` relied on the pipeline's 0.5s timeout ticks). | Added `_heartbeat` (0.5s) that pushes a live snapshot during long transfers; cancelled in `run()`'s `finally` (also covers `_collect_items` now that it runs inside the try). |
-| 7 | **`/tmp` could accumulate across crashes.** No startup cleanup existed. | Added `cleanup_stale_temp(max_age=3600)` — removes leftover `fwd_*` files older than 1h; called at the start of every `run()` and once at process startup. |
-| 8 | **Orphan heartbeat task** if `_collect_items` raised before the try/finally. | `_collect_items` moved inside the guarded `try` so the `finally` always cancels the heartbeat. |
-| 9 | Minor: pipeline config knobs (`DOWNLOAD_MULT`, `UPLOAD_MULT`, `MAX_DL_THREADS`, `MAX_UP_THREADS`) no longer have code consumers. | Left in `config.py` for env-file compatibility; harmless. |
+## Executive summary
 
-Note on the overlap-vs-serial conflict: `test_download_upload_overlap` asserted parallel pre-uploads
-(`upload_ready_order[-1] == 1`). Under the strict serial model that behavior no longer exists; the test was
-replaced by `test_download_strict_serial` which asserts the exact serial lifecycle
-(`dl, up, dl, up, ...` with no overlap) and that sends land in source order.
+The transfer engine is a **strict sequential pipeline**: one item at a time,
+`download -> verify -> upload -> delete temp -> next`. This already satisfies
+the "only ONE download / only ONE upload" invariant. It is NOT a multi-queue
+architecture, so nothing was rewritten — the sequential loop was hardened.
 
-### `bot/scheduler.py` (scheduled jobs)
-| # | Finding | Fix |
-|---|---------|-----|
-| 1 | **One shared `TransferEngine` instance across up to 2 concurrent jobs** (`self._sem = Semaphore(2)`). Two `run()` calls mutating the same `_stop/_skip/_paused/_operation/_file_dl` would corrupt each other. | Each job now builds a **fresh `TransferEngine()`** per run. |
-| 2 | **Duplicate per-account clients.** `_build_client` created a brand-new `TelegramClient` outside the pool for every job run — if a user-initiated transfer and a scheduled job (or two jobs) hit the same account, two processes shared one session → Telegram "wrong session ID" / "very old message" warnings. | Removed `_build_client`; scheduled jobs now use `client_pool.get(user_id, sid)` — exactly one client per account. |
+The freezes the operator sees are caused by **unbounded awaits**. A network
+operation (`download_media`, `send_file`, `edit_message`, `get_messages`, ...)
+that stops making progress has no timeout, no stall watchdog, and nothing that
+detects it. One hung await inside `_process_item` freezes the whole transfer,
+progress stops updating, the queue stops, and only a Render redeploy fixes it.
 
-### `bot/client_pool.py`
-| # | Finding | Fix |
-|---|---------|-----|
-| 1 | **Dead client reuse.** `get()` returned a pooled client even if its connection had dropped; a long-lived process would keep failing on a dead socket. | Added a reconnect guard: `get()` returns the pooled client only when `is_connected()`; otherwise it rebuilds a fresh client (under the per-account lock) and swaps it in. The single-client-per-account invariant is preserved. |
+## 1. Critical findings (why the bot freezes)
 
-### `bot/main.py`
-| # | Finding | Fix |
-|---|---------|-----|
-| 1 | No `/tmp` hygiene at boot. | `TransferEngine.cleanup_stale_temp()` called after DB init. |
+| # | File:line | Issue | Why it happens |
+|---|-----------|-------|----------------|
+| C1 | `bot/transfer_engine.py:610`, `:650`, `:834`, `:882`, `:910`, `:940`, `:1014`, `:1038` | **No timeouts on any network op** (`download_media`, `send_file`, `forward_messages`, `send_message`, `get_messages`). | A hung TCP connection / Telegram outage leaves the `await` pending forever. The engine never advances; the queue appears frozen. |
+| C2 | `bot/transfer_engine.py:799-800` | **`retry_count == 0` (the UI "Unlimited" option) retries forever.** | `if cfg.retry_count == 0 or attempts <= cfg.retry_count` is always true when `retry_count == 0`, so a permanently-failing message loops forever with capped 10s backoff. The queue is stuck on one item forever. |
+| C3 | `bot/transfer_engine.py:652-695` | `_download_media_parallel` part-downloads have **no progress stall watchdog**. | `iter_download` can hang mid-file. No detection → worker freezes. |
+| C4 | `bot/handlers/transfer.py:487` | `bot.edit_message` for the live progress is **awaited inline by the engine** (via `progress_cb` -> `render`) with **no timeout**. | If the bot's own Telegram connection hangs, every progress edit hangs. Because the engine awaits `progress_cb` inline (`transfer_engine.py:407/432/437/460`), one hung edit freezes the whole transfer. |
+| C5 | `bot/transfer_engine.py:461` | `run()` swallows `asyncio.CancelledError`. | External task cancellation during shutdown is not propagated, leaving cleanup incomplete. |
+| C6 | `bot/main.py:198` | `bot.run_until_disconnected()` is called once; an unexpected disconnect ends `main()` and the process. | On Render, a network drop that does not kill the container leaves the bot dead until a manual redeploy. |
+| C7 | `bot/client_pool.py:37` | Pooled client is returned whenever `is_connected()` is true — a half-dead socket still counts as connected. | Requests on a dead socket hang (see C1). No proactive sweep of dead clients. |
 
-### `tests/test_engine.py`
-- `DownloadClient` now records a strict event log (`sequence`: `("dl", id)` / `("up", id)`) so serial ordering is provable.
-- `test_download_upload_overlap` → `test_download_strict_serial` (asserts `dl/up` strict alternation, no overlap).
-- `test_download_flood_cap`'s `FloodClient` now raises `FloodWaitError` in `send_file` (the engine no longer calls `upload_file`).
+## 2. Pause/Resume — why it is broken
 
-## 2. What did NOT change (per constraints)
-- UI, bot commands, callback structure, wizard, DB schema, settings, login flow, scheduler UX, progress text, buttons — untouched.
-- `Download & Re-upload` still re-groups albums and keeps reply-chain mapping.
-- Large single files are still fetched with concurrent part-requests (`_download_media_parallel`), so per-file speed is preserved while only **one file** downloads at a time.
-- Retry semantics (`_with_retries`: FloodWait cap, ChatForwardsRestricted fallback to download mode, backoff, `retry_count`, `auto_resume`) unchanged.
+Pause is **cooperative and only checked between whole items**:
 
-## 3. Runtime expectations at ~5k transfers / ~100GB+100GB per day
-- RAM: bounded — at most one file in `/tmp` plus one in-flight upload at a time.
-- Disk: bounded — temp files deleted per item, startup sweep clears crash leftovers.
-- Concurrency: exactly one download and one upload active per account; scheduled and manual runs share the pool.
+* `bot/transfer_engine.py:247-253` `request_pause` only flips a flag; nothing
+  interrupts the current download/upload.
+* `bot/transfer_engine.py:422` the only pause check is at the top of the item
+  loop, so the current item (download **and** upload) finishes before pausing.
+  That is why the user sees "current transfer does not pause / queue
+  continues".
+* `_sleep_interruptible` (`transfer_engine.py:806`) does not react to pause, so
+  retry backoff and FloodWait sleeps ignore it too.
+* The Resume button depends on `snap["render"]` editing the message; if that
+  edit hangs (C4) or the engine is frozen, the button never changes.
+* There is no pause checkpoint *between* the download and the upload of one
+  file, so a large file cannot be paused at a safe boundary.
+
+## 3. Worker / queue / task issues
+
+| # | File:line | Issue |
+|---|-----------|-------|
+| W1 | `transfer_engine.py:499-507` `_collect_items` / `:510` `_fetch_existing` | Batch `get_messages` has no timeout and no retry. A slow/hung fetch skips nothing and can hang the run start. |
+| W2 | `transfer_engine.py:269` `collect_ids` | `client.iter_messages` iteration has no per-item timeout; the wizard "Start Transfer" can hang. |
+| W3 | `transfer_engine.py:406-411` heartbeat | Orphan risk if `run` is cancelled before `finally`; today `_collect_items` is inside the `try` so this is mostly fixed, but it still pushes progress 2x/sec needlessly. |
+| W4 | `transfer_engine.py:714-717` | `db.is_transferred` is awaited outside any try/except; a Mongo stall counts the item as failed (or hangs up to the socket timeout). |
+| W5 | `scheduler.py:53-63` | No watchdog on scheduled job tasks; an old hung job could keep its `_executing` entry forever (mitigated once the engine has op timeouts). |
+| W6 | `handlers/transfer.py:463` | Each run builds a fresh engine (good). But `transfer.py:29` / `jobs.py:18` / `transfer_engine.py:1114` module singletons are only used for stateless `collect_ids` — harmless but misleading. |
+
+## 4. Session management
+
+* One client per `(user_id, sid)` is enforced by `client_pool.py:42-79` (per-key
+  lock + double-check). Good.
+* Session is rebuilt when `is_connected()` is false. Good.
+* Missing: a dead-socket client that *reports* connected (C7), and no
+  engine-level recovery that refreshes the client after repeated network
+  failures mid-run.
+
+## 5. Memory / disk
+
+* Temp files are removed in `finally` in `_download_transfer`
+  (`transfer_engine.py:1063-1069`). Good.
+* `cleanup_stale_temp` runs at boot + per run. Good.
+* Orphan tasks: `_download_media_parallel` uses `asyncio.gather` (cleaned up on
+  cancel). The handler `update_task` is cancelled in `execute`'s `finally`. OK.
+* New risk after decoupling edits: fire-and-forget render tasks must be tracked
+  and cancelled or the bot leaks tasks / can write stale progress after the run
+  ends.
+
+## 6. Render / process lifecycle
+
+* `web.py` health endpoint always returns 200 even if the bot thread died →
+  Render never restarts it. The bot can be dead while health says "OK".
+* `main.py` needs an explicit reconnect loop + a bot health watchdog so an
+  unexpected disconnect self-heals without a redeploy.
+
+## Fix plan (implemented below)
+
+1. **Operation guards** (`_guard`): every network op is wrapped so it can
+   (a) hit a hard timeout, (b) be cancelled by a **progress-stall watchdog** for
+   long downloads/uploads, and (c) be interrupted by Pause. No op can hang
+   forever.
+2. **Retry safety**: per-item retry deadline caps "Unlimited" retries so the
+   queue always makes forward progress.
+3. **Pause redesign**: dense checkpoints + immediate interruption of the
+   current download/upload (cancelled and re-run on resume), preserving overall
+   progress and queue position. Resume continues from exactly where Pause
+   happened (current file restarts, item is retried).
+4. **Progress decoupled from the engine**: renders are fire-and-forget bounded
+   tasks with their own timeout; a slow edit can no longer stall a transfer.
+5. **Client recovery**: `client_pool.sweep()` for dead clients + engine-level
+   `refresh_client` hook that rebuilds the account client after repeated
+   network failures.
+6. **Main loop**: reconnect-on-disconnect with backoff + bot health watchdog.
+7. **web.py**: health endpoint returns 503 when the bot thread is dead so
+   Render restarts the process.
+8. **Timeouts for the wizard / scheduler / login** so no user-facing path can
+   hang forever.
+9. **Logging**: worker start/stop, download/upload start/finish, retries,
+   pauses, timeouts, watchdogs, reconnects.
+
+No UI text, keyboard layout, callback payload, command, DB schema or settings
+changed. Existing features and UX are preserved.

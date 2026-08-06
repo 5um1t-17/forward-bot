@@ -6,10 +6,13 @@ import logging
 import os
 
 from telethon import TelegramClient, events
+from telethon.tl.functions.help import GetNearestDcRequest
 
 from bot import keyboards, text
+from bot.client_pool import client_pool
 from bot.config import config
 from bot.db import db
+from bot.health import mark_bot_alive
 from bot.handlers import accounts, commands, jobs, settings as settings_handler, start, stats, transfer
 from bot.logger import setup_logging
 from bot.scheduler import Scheduler
@@ -165,6 +168,80 @@ async def _cancel(bot, event, uid: int) -> None:
     )
 
 
+async def _bot_alive(bot: TelegramClient, timeout: float | None = None) -> bool:
+    """Lightweight RPC round-trip used by the health watchdog."""
+    try:
+        await asyncio.wait_for(
+            bot(GetNearestDcRequest()), timeout=timeout or config.BOT_PING_TIMEOUT
+        )
+        return True
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+        return False
+
+
+async def _bot_health_watchdog(bot: TelegramClient) -> None:
+    """Ping the bot every interval; force a reconnect when it goes silent.
+
+    ``run_until_disconnected`` only returns on a clean disconnect — if the
+    MTProto link wedges without raising, the process would sit frozen forever.
+    This watchdog detects that and breaks the loop so :func:`main` reconnects.
+    """
+    while True:
+        await asyncio.sleep(config.BOT_WATCHDOG_INTERVAL)
+        if not await _bot_alive(bot):
+            log.warning("bot health watchdog: bot unresponsive, forcing reconnect")
+            try:
+                await bot.disconnect()
+            except Exception:
+                pass
+            return
+
+
+async def _pool_sweep_loop() -> None:
+    """Periodically drop half-dead account clients from the pool."""
+    while True:
+        await asyncio.sleep(config.POOL_SWEEP_INTERVAL)
+        try:
+            await client_pool.sweep()
+        except Exception:
+            log.exception("client pool sweep failed")
+
+
+async def run_bot_once() -> None:
+    """Connect, register handlers, and run until disconnected or unhealthy."""
+    bot = TelegramClient(
+        os.path.join(config.SESSION_DIR, "bot"), config.API_ID, config.API_HASH
+    )
+    await bot.start(bot_token=config.BOT_TOKEN)
+    me = await bot.get_me()
+    log.info("Bot running as @%s", me.username)
+
+    await register_bot_commands(bot)
+
+    register_handlers(bot)
+
+    scheduler = Scheduler(bot)
+    scheduler_task = asyncio.create_task(scheduler.loop())
+    sweep_task = asyncio.create_task(_pool_sweep_loop())
+    watchdog_task = asyncio.create_task(_bot_health_watchdog(bot))
+
+    # Bot is ready. The flag intentionally stays True across the reconnect
+    # backoff so the health endpoint never reports 503 during a brief
+    # disconnect (which would make the platform restart the process
+    # mid-transfer). Only a permanently dead thread reports 503.
+    mark_bot_alive(True)
+    try:
+        await bot.run_until_disconnected()
+    finally:
+        for task in (watchdog_task, sweep_task, scheduler_task):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await bot.disconnect()
+
+
 async def main() -> None:
     setup_logging()
     if not config.configured:
@@ -182,29 +259,22 @@ async def main() -> None:
     TransferEngine.cleanup_stale_temp()
 
     os.makedirs(config.SESSION_DIR, exist_ok=True)
-    bot = TelegramClient(os.path.join(config.SESSION_DIR, "bot"), config.API_ID, config.API_HASH)
-    await bot.start(bot_token=config.BOT_TOKEN)
-    me = await bot.get_me()
-    log.info("Bot running as @%s", me.username)
 
-    await register_bot_commands(bot)
-
-    register_handlers(bot)
-
-    scheduler = Scheduler(bot)
-    scheduler_task = asyncio.create_task(scheduler.loop())
-
-    try:
-        await bot.run_until_disconnected()
-    finally:
-        scheduler_task.cancel()
+    # Reconnect-on-disconnect loop with backoff: an unexpected disconnect
+    # (network blip, Telegram-side drop, watchdog trigger) self-heals without
+    # a manual Render redeploy.
+    backoff = config.RECONNECT_DELAY
+    while True:
         try:
-            await scheduler_task
+            await run_bot_once()
         except asyncio.CancelledError:
-            pass
-        await bot.disconnect()
-        if db.client is not None:
-            db.client.close()
+            mark_bot_alive(False)
+            raise
+        except Exception:
+            log.exception("bot loop crashed; restarting")
+        log.warning("Bot disconnected; reconnecting in %.0fs", backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":

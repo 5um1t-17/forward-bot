@@ -1,6 +1,7 @@
 """Account management: add (login), switch active, delete."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telethon import Button, events
@@ -13,6 +14,7 @@ from telethon.errors import (
 )
 
 from bot import keyboards, text
+from bot.config import config
 from bot.db import db
 from bot.handlers.common import answer, edit
 from bot.session_manager import session_manager
@@ -133,8 +135,10 @@ async def _on_phone(bot, event, uid: int) -> bool:
         return True
     try:
         client = session_manager.build_client()
-        await client.connect()
-        result = await client.send_code_request(phone)
+        await asyncio.wait_for(client.connect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
+        result = await asyncio.wait_for(
+            client.send_code_request(phone), timeout=config.OP_TIMEOUT
+        )
         state = LoginState(phone=phone, code_hash=result.phone_code_hash, client=client, step="code")
         store.login[uid] = state
         store.set_pending(uid, "login_code")
@@ -195,7 +199,10 @@ async def _on_code(bot, event, uid: int) -> bool:
         return True
     code = event.raw_text.strip()
     try:
-        await state.client.sign_in(phone=state.phone, code=code, phone_code_hash=state.code_hash)
+        await asyncio.wait_for(
+            state.client.sign_in(phone=state.phone, code=code, phone_code_hash=state.code_hash),
+            timeout=config.OP_TIMEOUT,
+        )
     except SessionPasswordNeededError:
         state.step = "password"
         store.set_pending(uid, "login_password")
@@ -239,7 +246,9 @@ async def _on_password(bot, event, uid: int) -> bool:
         store.set_pending(uid, None)
         return True
     try:
-        await state.client.sign_in(password=event.raw_text)
+        await asyncio.wait_for(
+            state.client.sign_in(password=event.raw_text), timeout=config.OP_TIMEOUT
+        )
     except Exception as exc:
         log.warning("2FA sign-in failed: %s", exc)
         await event.respond("⚠️ Wrong password. Try again.", parse_mode="html")
@@ -256,7 +265,7 @@ async def _on_password(bot, event, uid: int) -> bool:
 
 async def _finalize_login(bot, event, uid: int, state: LoginState) -> None:
     client = state.client
-    me = await client.get_me()
+    me = await asyncio.wait_for(client.get_me(), timeout=config.OP_TIMEOUT)
     session_string = client.session.save()
     name = getattr(me, "first_name", "") or getattr(me, "username", "") or state.phone
     display = f"{name}" if not getattr(me, "username", None) else f"{name} (@{me.username})"

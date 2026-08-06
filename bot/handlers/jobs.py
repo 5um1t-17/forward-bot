@@ -1,6 +1,7 @@
 """Saved jobs: list, run again, delete."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telethon import Button, events
@@ -91,8 +92,8 @@ async def _delete(bot, event, uid: int, jid: str) -> bool:
 
 
 async def _cfg_from_job(client, job: dict) -> TransferConfig:
-    src = await client.get_entity(job["source"]["id"])
-    dst = await client.get_entity(job["dest"]["id"])
+    src = await asyncio.wait_for(client.get_entity(job["source"]["id"]), timeout=config.OP_TIMEOUT)
+    dst = await asyncio.wait_for(client.get_entity(job["dest"]["id"]), timeout=config.OP_TIMEOUT)
     if job.get("count_mode") == "latest":
         ids = await engine.collect_ids(
             client, src, job.get("count", 10), None, None, job.get("filter_type", "all")

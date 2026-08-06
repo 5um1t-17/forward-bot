@@ -66,6 +66,43 @@ class Config:
     MAX_FLOOD_WAIT: float = 600
     FLOOD_BUFFER: float = 0.5
 
+    # ------------------------------------------------------------------
+    # Reliability / self-healing knobs
+    # ------------------------------------------------------------------
+    # Hard timeout for "quick" Telegram operations (forward/send/copy/get).
+    # Anything that stops responding longer than this is aborted and retried.
+    OP_TIMEOUT: float = float(os.getenv("OP_TIMEOUT", "120"))
+
+    # Timeout for fetching message metadata / iterating messages.
+    MSG_FETCH_TIMEOUT: float = float(os.getenv("MSG_FETCH_TIMEOUT", "60"))
+
+    # Stall watchdog: a download/upload that reports no progress for this many
+    # seconds is cancelled and retried. Big files legitimately take a long
+    # time, so this is based on *progress*, not wall-clock duration.
+    STALL_TIMEOUT: float = float(os.getenv("STALL_TIMEOUT", "120"))
+
+    # Cap on how long one item may spend inside the retry machinery (covers the
+    # UI "Unlimited" retry setting). After this the item is counted as failed so
+    # the queue always keeps moving.
+    MAX_ITEM_RETRY_SECONDS: float = float(os.getenv("MAX_ITEM_RETRY_SECONDS", "900"))
+
+    # Timeout for the bot's own progress-message edits. Edits are decoupled from
+    # the transfer engine, so a slow edit can never stall a transfer.
+    EDIT_TIMEOUT: float = float(os.getenv("EDIT_TIMEOUT", "15"))
+
+    # Pause / stop poll granularity for interrupting in-flight operations.
+    CONTROL_POLL: float = 0.25
+
+    # Reconnect loop for the bot client.
+    RECONNECT_DELAY: float = float(os.getenv("RECONNECT_DELAY", "5"))
+
+    # Bot health watchdog: ping interval and per-ping timeout.
+    BOT_WATCHDOG_INTERVAL: float = float(os.getenv("BOT_WATCHDOG_INTERVAL", "30"))
+    BOT_PING_TIMEOUT: float = float(os.getenv("BOT_PING_TIMEOUT", "10"))
+
+    # How often the client pool sweeps dead clients.
+    POOL_SWEEP_INTERVAL: float = float(os.getenv("POOL_SWEEP_INTERVAL", "60"))
+
     @property
     def configured(self) -> bool:
         return bool(self.API_ID and self.API_HASH and self.BOT_TOKEN)

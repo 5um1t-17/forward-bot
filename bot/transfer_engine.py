@@ -36,13 +36,14 @@ Strategy
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TypeVar
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
@@ -62,7 +63,18 @@ log = logging.getLogger("bot.engine")
 # (the handler throttles actual message edits to PROGRESS_REFRESH).
 _HEARTBEAT_INTERVAL = 0.5
 
+# Exceptions that indicate the underlying MTProto connection is likely dead.
+# When one of these is raised repeatedly, the engine asks the caller to rebuild
+# the account client before the next retry.
+NETWORK_ERRORS = (
+    ConnectionError,
+    OSError,
+    asyncio.TimeoutError,
+    TimeoutError,
+)
+
 ProgressCb = Callable[[dict], Awaitable[None]]
+_TCoro = TypeVar("_TCoro")
 
 
 @dataclass
@@ -222,7 +234,8 @@ class TransferEngine:
         self._skip_evt = asyncio.Event()
         self._skip_target: int | None = None
         self._current_index: int = 0
-        # pause / resume (cooperative: halts between messages)
+        # pause / resume: request_pause() sets the flag+event, request_resume()
+        # clears them. Dense checkpoints + op cancellation make it immediate.
         self._paused = False
         self._pause_evt = asyncio.Event()
         # live progress snapshot attributes
@@ -231,6 +244,13 @@ class TransferEngine:
         self._file_dl: dict | None = None
         self._file_up: dict | None = None
         self._flood_wait: float | None = None
+        self._mode: str = "forward"
+        # account client used by the current run; refreshed on network failure
+        self._client: object = None
+        self._refresh_client: Callable[[], Awaitable[object]] | None = None
+        # retry safety: a per-item deadline guarantees the queue always moves
+        self._item_deadline: float = 0.0
+        self._last_refresh_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # control
@@ -245,10 +265,12 @@ class TransferEngine:
         self._skip_target = self._current_index
 
     def request_pause(self) -> None:
+        log.info("Pause requested")
         self._paused = True
         self._pause_evt.set()
 
     def request_resume(self) -> None:
+        log.info("Resume requested")
         self._paused = False
         self._pause_evt.clear()
 
@@ -266,15 +288,23 @@ class TransferEngine:
         if count is not None:
             ids: list[int] = []
             cap = max(5000, count * 10)
-            async for msg in client.iter_messages(source):
-                if len(ids) >= count:
-                    break
-                if isinstance(msg, types.MessageService):
-                    continue
-                if message_matches_filter(msg, filter_type):
-                    ids.append(msg.id)
-                if len(ids) >= cap:
-                    break
+            try:
+                async for msg in self._iter_bounded(
+                    client.iter_messages(source), config.MSG_FETCH_TIMEOUT
+                ):
+                    if len(ids) >= count:
+                        break
+                    if isinstance(msg, types.MessageService):
+                        continue
+                    if message_matches_filter(msg, filter_type):
+                        ids.append(msg.id)
+                    if len(ids) >= cap:
+                        break
+            except asyncio.TimeoutError as exc:
+                raise ValueError(
+                    "Timed out scanning the source chat for messages. "
+                    "Try a smaller range or check the network."
+                ) from exc
             ids.reverse()  # ascending for reply mapping
             return ids
 
@@ -286,6 +316,19 @@ class TransferEngine:
             )
         ids = list(range(lo, hi + 1))
         return ids
+
+    @staticmethod
+    def _iter_bounded(aiter, timeout: float):
+        """Wrap an async iterator so every ``__anext__`` has a hard timeout.
+
+        Prevents a hung source chat from blocking message collection forever.
+        """
+        it = aiter.__aiter__()
+
+        async def _anext():
+            return await asyncio.wait_for(it.__anext__(), timeout=timeout)
+
+        return _BoundedIter(_anext)
 
     # ------------------------------------------------------------------
     # live progress state
@@ -380,6 +423,7 @@ class TransferEngine:
         client: TelegramClient,
         cfg: TransferConfig,
         progress_cb: ProgressCb | None = None,
+        refresh_client: Callable[[], Awaitable[object | None]] | None = None,
     ) -> TransferResult:
         self._stop.clear()
         self._cancelled = False
@@ -392,11 +436,15 @@ class TransferEngine:
         self._file_dl = None
         self._file_up = None
         self._flood_wait = None
+        self._mode = cfg.mode
+        self._client = client
+        self._refresh_client = refresh_client
+        self._last_refresh_ts = 0.0
         result = TransferResult(total=len(cfg.message_ids))
         start = time.monotonic()
         state_builder = lambda: self._progress_state(result, cfg, start)  # noqa: E731
         log.info(
-            "Starting transfer run: mode=%s total=%d forward_delay=%s threads=%s",
+            "Worker started: mode=%s total=%d forward_delay=%s threads=%s",
             cfg.mode,
             len(cfg.message_ids),
             cfg.forward_delay,
@@ -414,12 +462,16 @@ class TransferEngine:
         ids = sorted(cfg.message_ids)
         aborted = False
         try:
-            items = await self._collect_items(client, cfg, ids)
-            for i, item in enumerate(items):
+            items, fetch_failed = await self._collect_items(cfg, ids)
+            if fetch_failed:
+                result.failed += fetch_failed
+            i = 0
+            while i < len(items):
+                item = items[i]
                 self._current_index = i
                 if self._stop.is_set():
                     break
-                if self._paused and not await self._wait_if_paused(progress_cb, state_builder):
+                if not await self._pause_gate(progress_cb, state_builder):
                     break
                 if self._skip_evt.is_set():
                     self._skip_evt.clear()
@@ -430,37 +482,53 @@ class TransferEngine:
                     self._flood_wait = None
                     if progress_cb is not None:
                         await progress_cb(state_builder())
+                    i += 1
                     continue
                 self._set_current(cfg, item)
                 self._operation = _verb(cfg.mode)
                 if progress_cb is not None:
                     await progress_cb(state_builder())
+                self._item_deadline = time.monotonic() + config.MAX_ITEM_RETRY_SECONDS
                 try:
                     await self._process_item(
-                        client, cfg, item, result, reply_map, skip_idx=i,
+                        cfg, item, result, reply_map, skip_idx=i,
                         progress_cb=progress_cb, state_builder=state_builder,
                     )
+                except _Paused:
+                    log.info("Worker paused mid-item (index %d)", i)
+                    if not await self._pause_gate(progress_cb, state_builder):
+                        break
+                    continue  # retry the same item after resume
                 except _SkipCurrent:
                     self._skip_evt.clear()
                     self._skip_target = None
                     result.skipped += item["count"]
+                    i += 1
+                    continue
                 except _Abort:
                     aborted = True
                     break
                 except Exception as exc:  # noqa: BLE001
                     log.warning("item failed: %s", exc)
                     result.failed += item["count"]
-                self._current_index = i + 1
+                    i += 1
+                    continue
+                i += 1
+                self._current_index = i
                 if cfg.forward_delay and not self._stop.is_set():
                     try:
-                        await self._sleep_interruptible(cfg.forward_delay, skip_idx=i + 1)
+                        await self._sleep_interruptible(cfg.forward_delay, skip_idx=i)
                     except _SkipCurrent:
                         pass
+                    except _Paused:
+                        if not await self._pause_gate(progress_cb, state_builder):
+                            break
                 if progress_cb is not None:
                     await progress_cb(state_builder())
         except asyncio.CancelledError:
             result.cancelled = True
             self._stop.set()
+            raise
         except Exception as exc:  # noqa: BLE001
             log.exception("transfer run aborted")
             result.cancelled = True
@@ -476,7 +544,7 @@ class TransferEngine:
 
         result.duration = time.monotonic() - start
         log.info(
-            "Transfer run finished: mode=%s total=%d success=%d skipped=%d failed=%d cancelled=%s duration=%.1fs",
+            "Worker stopped: mode=%s total=%d success=%d skipped=%d failed=%d cancelled=%s duration=%.1fs",
             cfg.mode,
             result.total,
             result.success,
@@ -496,25 +564,53 @@ class TransferEngine:
             result.error = "stopped by user"
         return result
 
-    async def _collect_items(self, client, cfg, ids: list[int]) -> list[dict]:
+    async def _collect_items(self, cfg, ids: list[int]) -> tuple[list[dict], int]:
         items: list[dict] = []
+        fetch_failed = 0
         for chunk_start in range(0, len(ids), config.BATCH_SIZE):
             if self._stop.is_set():
                 break
             chunk = ids[chunk_start:chunk_start + config.BATCH_SIZE]
-            msgs = await self._fetch_existing(client, cfg.source_entity, chunk)
+            msgs, failed = await self._fetch_existing(cfg.source_entity, chunk)
+            if failed:
+                log.warning("skipping %d message(s): chunk fetch failed", failed)
+                fetch_failed += failed
             items.extend(self._build_items(msgs, cfg))
-        return items
+        return items, fetch_failed
 
     # ------------------------------------------------------------------
-    async def _fetch_existing(self, client, source, chunk: list[int]) -> list:
-        try:
-            found = await client.get_messages(source, ids=chunk)
-        except (MessageIdInvalidError, ValueError):
-            found = []
-        if not isinstance(found, list):
-            found = [found] if found else []
-        return found
+    async def _fetch_existing(self, source, chunk: list[int]) -> tuple[list, int]:
+        """Fetch one chunk with retries and a hard timeout.
+
+        Returns ``(found_messages, failed_count)``. Never hangs: after retries
+        the chunk is abandoned and counted as failed so the run moves on.
+        """
+        attempts = 0
+        while True:
+            if self._stop.is_set():
+                return [], len(chunk)
+            try:
+                found = await asyncio.wait_for(
+                    self._client.get_messages(source, ids=chunk),
+                    timeout=config.MSG_FETCH_TIMEOUT,
+                )
+            except (MessageIdInvalidError, ValueError):
+                found = []
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                attempts += 1
+                log.warning("message fetch failed (attempt %d): %s", attempts, exc)
+                if self._stop.is_set() or attempts >= 3:
+                    return [], len(chunk)
+                try:
+                    await self._sleep_interruptible(min(2 * attempts, 10), skip_idx=None)
+                except (_SkipCurrent, _Paused):
+                    pass
+                continue
+            if not isinstance(found, list):
+                found = [found] if found else []
+            return found, 0
 
     def _build_items(self, msgs: list, cfg: TransferConfig) -> list[dict]:
         groups: dict[int, list] = {}
@@ -576,21 +672,115 @@ class TransferEngine:
         return removed
 
     # ------------------------------------------------------------------
-    async def _wait_if_paused(self, progress_cb, state_builder) -> bool:
-        """Wait until resumed; returns False if the run was stopped meanwhile."""
+    async def _pause_gate(self, progress_cb, state_builder) -> bool:
+        """Wait at a checkpoint while paused; returns False if stopped meanwhile.
+
+        Also called after a mid-item pause so the queue resumes exactly where
+        it was interrupted.
+        """
+        if not self._pause_evt.is_set():
+            return True
+        log.info("Worker paused")
         while self._pause_evt.is_set():
             if self._stop.is_set():
                 return False
+            self._operation = "Paused"
             if progress_cb is not None and state_builder is not None:
                 state = state_builder()
                 state["operation"] = "Paused"
                 state["paused"] = True
                 await progress_cb(state)
             await asyncio.sleep(1.0)
+        self._operation = _verb(self._mode) if self._mode else "Transferring"
+        log.info("Worker resumed")
         return True
 
+    # ------------------------------------------------------------------
+    async def _guard(
+        self,
+        coro,
+        *,
+        timeout: float | None = None,
+        progress: Callable[[], int | None] | None = None,
+        stall_timeout: float | None = None,
+        opname: str = "operation",
+    ):
+        """Run a network operation with a hard timeout and a stall watchdog.
 
-    async def _download_one(self, client, msg, temp_paths: set[str]) -> str | None:
+        * ``timeout`` — hard wall-clock limit for quick operations.
+        * ``progress`` + ``stall_timeout`` — cancels when no progress is
+          reported for ``stall_timeout`` seconds (long downloads/uploads that
+          have no sane wall-clock limit).
+        * Pause: while the op is in flight, ``request_pause`` cancels it and
+          raises :class:`_Paused` so the item is retried after resume.
+
+        Nothing can hang forever: every path either returns the result, raises
+        the underlying error, raises ``TimeoutError`` (retried upstream) or
+        raises ``_Paused``.
+        """
+        if self._pause_evt.is_set():
+            raise _Paused()
+        task = asyncio.create_task(coro)
+        last_ts = time.monotonic()
+        last_prog = progress() if progress is not None else None
+        seen_progress = progress is not None and last_prog is not None
+        deadline = (time.monotonic() + timeout) if timeout else None
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=config.CONTROL_POLL)
+                if task in done:
+                    return task.result()
+                now = time.monotonic()
+                if self._pause_evt.is_set():
+                    log.info("Pause interrupted %s, cancelling", opname)
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise _Paused()
+                if progress is not None:
+                    cur = progress()
+                    # Only apply the stall watchdog once a real progress value
+                    # has been observed: an op whose callback never fires (e.g.
+                    # some album uploads) must never be cancelled for "no
+                    # progress" while it is actually making progress.
+                    if cur is not None and not seen_progress:
+                        seen_progress = True
+                        last_prog = cur
+                        last_ts = now
+                    elif seen_progress:
+                        if cur != last_prog:
+                            last_prog = cur
+                            last_ts = now
+                        elif stall_timeout and now - last_ts >= stall_timeout:
+                            log.warning(
+                                "Watchdog: %s stalled (%ss with no progress), cancelling",
+                                opname, stall_timeout,
+                            )
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await task
+                            raise asyncio.TimeoutError(
+                                f"{opname} stalled ({stall_timeout:.0f}s no progress)"
+                            )
+                if deadline is not None and now >= deadline:
+                    log.warning("Watchdog: %s timed out after %ss", opname, timeout)
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise asyncio.TimeoutError(f"{opname} timed out after {timeout:.0f}s")
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    def _dl_progress(self) -> int | None:
+        return (self._file_dl or {}).get("done")
+
+    def _up_progress(self) -> int | None:
+        return (self._file_up or {}).get("done")
+
+    async def _download_one(self, msg, temp_paths: set[str]) -> str | None:
         """Download one message's media to a temp file and verify it.
 
         Returns the temp path on success, or ``None`` when the media is simply
@@ -606,9 +796,13 @@ class TransferEngine:
         progress = self._file_progress_cb(
             _msg_filename(msg) or f"message_{msg.id}", "Downloading", "dl"
         )
+        log.info("Download started: msg=%d -> %s", msg.id, tmp_path)
         try:
-            path = await self._download_media(client, msg, tmp_path, progress)
+            path = await self._download_media(msg, tmp_path, progress)
         except asyncio.CancelledError:
+            raise
+        except _Paused:
+            log.info("Download paused: msg=%d", msg.id)
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("download failed for msg %s: %s", msg.id, exc)
@@ -623,9 +817,10 @@ class TransferEngine:
         if size <= 0:
             log.warning("download produced an empty file for msg %s", msg.id)
             return None
+        log.info("Download finished: msg=%d (%.1f MB)", msg.id, size / (1024 * 1024))
         return path
 
-    async def _download_media(self, client, msg, tmp_path: str, progress) -> str | None:
+    async def _download_media(self, msg, tmp_path: str, progress) -> str | None:
         """Download one message's media, parallelising large documents."""
         media = msg.media
         doc = media.document if isinstance(media, types.MessageMediaDocument) else None
@@ -639,21 +834,32 @@ class TransferEngine:
             )
             try:
                 return await self._download_media_parallel(
-                    client, location, size, tmp_path, progress, config.DOWNLOAD_PARTS
+                    location, size, tmp_path, progress, config.DOWNLOAD_PARTS
                 )
+            except _Paused:
+                raise
             except Exception as exc:  # noqa: BLE001
                 log.warning("parallel download failed (msg %s), falling back: %s", msg.id, exc)
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     pass
-        return await client.download_media(msg, file=tmp_path, progress_callback=progress)
+        return await self._guard(
+            self._client.download_media(msg, file=tmp_path, progress_callback=progress),
+            progress=self._dl_progress,
+            stall_timeout=config.STALL_TIMEOUT,
+            opname=f"download msg={msg.id}",
+        )
 
     async def _download_media_parallel(
-        self, client, location, file_size: int, dest_path: str,
+        self, location, file_size: int, dest_path: str,
         progress, parts: int,
     ) -> str:
-        """Download one file using ``parts`` concurrent part requests."""
+        """Download one file using ``parts`` concurrent part requests.
+
+        Wrapped in :meth:`_guard` so the whole parallel transfer is
+        cancellable on pause/stop and bounded by the stall watchdog.
+        """
         part_size = 512 * 1024
         total_parts = max(1, (file_size + part_size - 1) // part_size)
         n = max(1, min(parts, total_parts, 8))
@@ -674,7 +880,7 @@ class TransferEngine:
                 return
             offset = start_part * part_size
             num = end_part - start_part
-            iterator = client.iter_download(
+            iterator = self._client.iter_download(
                 location,
                 file_size=file_size,
                 chunk_size=part_size,
@@ -691,8 +897,16 @@ class TransferEngine:
                     report(len(chunk))
                     pos += len(chunk)
 
-        await asyncio.gather(*(asyncio.create_task(worker(i)) for i in range(n)))
-        return dest_path
+        async def run_workers() -> str:
+            await asyncio.gather(*(asyncio.create_task(worker(i)) for i in range(n)))
+            return dest_path
+
+        return await self._guard(
+            run_workers(),
+            progress=self._dl_progress,
+            stall_timeout=config.STALL_TIMEOUT,
+            opname=f"parallel download ({file_size / (1024 * 1024):.0f} MB)",
+        )
 
 
     @staticmethod
@@ -703,7 +917,7 @@ class TransferEngine:
 
     # ------------------------------------------------------------------
     async def _process_item(
-        self, client, cfg: TransferConfig, item: dict, result: TransferResult,
+        self, cfg: TransferConfig, item: dict, result: TransferResult,
         reply_map: dict, skip_idx: int | None = None,
         progress_cb: ProgressCb | None = None, state_builder=None,
     ) -> None:
@@ -717,7 +931,7 @@ class TransferEngine:
                     return
 
         await self._with_retries(
-            client, cfg, lambda: self._transfer(client, cfg, msgs, reply_map),
+            cfg, lambda: self._transfer(cfg, msgs, reply_map),
             skip_idx=skip_idx, progress_cb=progress_cb, state_builder=state_builder,
         )
 
@@ -729,17 +943,25 @@ class TransferEngine:
         result.success += sent_count
 
     async def _with_retries(
-        self, client, cfg, fn, skip_idx: int | None = None,
+        self, cfg, fn, skip_idx: int | None = None,
         progress_cb: ProgressCb | None = None, state_builder=None,
     ) -> None:
         attempts = 0
         flood_total = 0.0
         while True:
+            if self._item_deadline and time.monotonic() >= self._item_deadline:
+                log.warning(
+                    "Item deadline reached (%.0fs elapsed), skipping item",
+                    config.MAX_ITEM_RETRY_SECONDS,
+                )
+                raise _SkipCurrent()
             try:
                 return await fn()
             except _Abort:
                 raise
             except _SkipCurrent:
+                raise
+            except _Paused:
                 raise
             except FloodWaitError as exc:
                 if not cfg.handle_flood:
@@ -796,6 +1018,8 @@ class TransferEngine:
             except Exception as exc:  # noqa: BLE001 - retry generic failures too
                 log.warning("transfer error: %s", exc)
                 attempts += 1
+                if isinstance(exc, NETWORK_ERRORS):
+                    await self._refresh_if_needed()
                 if cfg.retry_count == 0 or attempts <= cfg.retry_count:
                     await self._sleep_interruptible(min(2 * attempts, 10), skip_idx=skip_idx)
                     continue
@@ -803,10 +1027,38 @@ class TransferEngine:
                     raise _Abort()
                 raise
 
+    async def _refresh_if_needed(self) -> None:
+        """Rebuild the account client on repeated network errors.
+
+        ``refresh_client`` (wired from the handler) re-creates the Telethon
+        client for this account so a dead MTProto connection self-heals
+        instead of retrying against a half-dead client forever. Guarded by a
+        cooldown so we never hammer the session factory.
+        """
+        if self._refresh_client is None:
+            return
+        now = time.monotonic()
+        if now - self._last_refresh_ts < config.RECONNECT_DELAY:
+            return
+        self._last_refresh_ts = now
+        log.info("Network failure detected, rebuilding account client...")
+        try:
+            new_client = await self._refresh_client()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("client refresh failed: %s", exc)
+            return
+        if new_client is None:
+            log.warning("client refresh returned no client; keeping current one")
+            return
+        self._client = new_client
+        log.info("Account client rebuilt after network failure")
+
     async def _sleep_interruptible(self, seconds: float, skip_idx: int | None = None) -> bool:
         """Sleep in slices; return False if stop was requested.
 
-        Raises ``_SkipCurrent`` when a skip was requested for ``skip_idx``.
+        Raises ``_SkipCurrent`` when a skip was requested for ``skip_idx`` and
+        raises ``_Paused`` when a pause interrupts the sleep so the current
+        item is retried after resume.
         """
         end = time.monotonic() + seconds
         while time.monotonic() < end:
@@ -814,31 +1066,37 @@ class TransferEngine:
                 return False
             if self._skip_target is not None and self._skip_target == skip_idx:
                 raise _SkipCurrent()
+            if self._pause_evt.is_set():
+                raise _Paused()
             await asyncio.sleep(min(1.0, end - time.monotonic()))
         return True
 
     # ------------------------------------------------------------------
-    async def _transfer(self, client, cfg, msgs: list, reply_map: dict) -> None:
+    async def _transfer(self, cfg, msgs: list, reply_map: dict) -> None:
         if cfg.mode == "forward":
-            await self._forward(client, cfg, msgs, reply_map)
+            await self._forward(cfg, msgs, reply_map)
         elif cfg.mode == "copy":
-            await self._copy(client, cfg, msgs, reply_map)
+            await self._copy(cfg, msgs, reply_map)
         elif cfg.mode == "download":
-            await self._download_transfer(client, cfg, msgs, reply_map)
+            await self._download_transfer(cfg, msgs, reply_map)
 
-    async def _forward(self, client, cfg, msgs: list, reply_map: dict) -> None:
+    async def _forward(self, cfg, msgs: list, reply_map: dict) -> None:
         ids = [m.id for m in msgs]
         as_album = len(msgs) > 1
         drop_captions = "remove_captions" in cfg.options
         drop_author = "hide_header" in cfg.options
-        sent = await client.forward_messages(
-            cfg.dest_entity,
-            ids,
-            from_peer=cfg.source_entity,
-            as_album=as_album,
-            drop_media_captions=drop_captions,
-            drop_author=drop_author,
-            silent=cfg.silent,
+        sent = await self._guard(
+            self._client.forward_messages(
+                cfg.dest_entity,
+                ids,
+                from_peer=cfg.source_entity,
+                as_album=as_album,
+                drop_media_captions=drop_captions,
+                drop_author=drop_author,
+                silent=cfg.silent,
+            ),
+            timeout=config.OP_TIMEOUT,
+            opname=f"forward msg(s) {[m.id for m in msgs]}",
         )
         if as_album:
             dest_ids = [s.id for s in sent]
@@ -847,20 +1105,20 @@ class TransferEngine:
         for m, did in zip(msgs, dest_ids):
             reply_map[m.id] = did
 
-    async def _copy(self, client, cfg, msgs: list, reply_map: dict) -> None:
+    async def _copy(self, cfg, msgs: list, reply_map: dict) -> None:
         if len(msgs) > 1:
-            await self._copy_album(client, cfg, msgs, reply_map)
+            await self._copy_album(cfg, msgs, reply_map)
             return
         m = msgs[0]
-        did = await self._copy_one(client, cfg, m, reply_map)
+        did = await self._copy_one(cfg, m, reply_map)
         if did is not None:
             reply_map[m.id] = did
 
-    async def _copy_album(self, client, cfg, msgs: list, reply_map: dict) -> None:
+    async def _copy_album(self, cfg, msgs: list, reply_map: dict) -> None:
         text_only = "text_only" in cfg.options
         if text_only:
             for m in msgs:
-                did = await self._copy_one(client, cfg, m, reply_map)
+                did = await self._copy_one(cfg, m, reply_map)
                 if did is not None:
                     reply_map[m.id] = did
             return
@@ -875,12 +1133,18 @@ class TransferEngine:
         ]
         if not media:
             for m in msgs:
-                did = await self._copy_one(client, cfg, m, reply_map)
+                did = await self._copy_one(cfg, m, reply_map)
                 if did is not None:
                     reply_map[m.id] = did
             return
-        sent = await client.send_file(
-            cfg.dest_entity, media, caption=caption, silent=cfg.silent
+        sent = await self._guard(
+            self._client.send_file(
+                cfg.dest_entity, media, caption=caption, silent=cfg.silent
+            ),
+            timeout=config.OP_TIMEOUT,
+            progress=self._up_progress,
+            stall_timeout=config.STALL_TIMEOUT,
+            opname=f"copy album ({len(media)} media)",
         )
         if isinstance(sent, list):
             dest_ids = [s.id for s in sent]
@@ -890,11 +1154,11 @@ class TransferEngine:
                 return
         # fallback: copy individually
         for m in msgs:
-            did = await self._copy_one(client, cfg, m, reply_map)
+            did = await self._copy_one(cfg, m, reply_map)
             if did is not None:
                 reply_map[m.id] = did
 
-    async def _copy_one(self, client, cfg, msg, reply_map: dict) -> int | None:
+    async def _copy_one(self, cfg, msg, reply_map: dict) -> int | None:
         text_only = "text_only" in cfg.options
         media_only = "media_only" in cfg.options
         drop_caption = "remove_captions" in cfg.options
@@ -907,13 +1171,17 @@ class TransferEngine:
             text = msg.text
             if not text:
                 return None
-            sent = await client.send_message(
-                cfg.dest_entity,
-                text,
-                formatting_entities=msg.entities,
-                parse_mode=None,
-                reply_to=reply_to,
-                silent=cfg.silent,
+            sent = await self._guard(
+                self._client.send_message(
+                    cfg.dest_entity,
+                    text,
+                    formatting_entities=msg.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                ),
+                timeout=config.OP_TIMEOUT,
+                opname=f"send text msg={msg.id}",
             )
             return sent.id
 
@@ -925,30 +1193,40 @@ class TransferEngine:
         media = msg.media
         is_webpage = isinstance(media, types.MessageMediaWebPage)
         if media and not is_webpage:
-            sent = await client.send_file(
-                cfg.dest_entity,
-                media,
-                caption=text,
-                formatting_entities=msg.entities,
-                parse_mode=None,
-                reply_to=reply_to,
-                silent=cfg.silent,
+            sent = await self._guard(
+                self._client.send_file(
+                    cfg.dest_entity,
+                    media,
+                    caption=text,
+                    formatting_entities=msg.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                ),
+                timeout=config.OP_TIMEOUT,
+                progress=self._up_progress,
+                stall_timeout=config.STALL_TIMEOUT,
+                opname=f"send file msg={msg.id}",
             )
             return sent.id
 
         if text:
-            sent = await client.send_message(
-                cfg.dest_entity,
-                text,
-                formatting_entities=msg.entities,
-                parse_mode=None,
-                reply_to=reply_to,
-                silent=cfg.silent,
+            sent = await self._guard(
+                self._client.send_message(
+                    cfg.dest_entity,
+                    text,
+                    formatting_entities=msg.entities,
+                    parse_mode=None,
+                    reply_to=reply_to,
+                    silent=cfg.silent,
+                ),
+                timeout=config.OP_TIMEOUT,
+                opname=f"send text msg={msg.id}",
             )
             return sent.id
         return None
 
-    async def _download_transfer(self, client, cfg, msgs: list, reply_map: dict) -> None:
+    async def _download_transfer(self, cfg, msgs: list, reply_map: dict) -> None:
         """Strictly sequential download & re-upload of a single item.
 
         Lifecycle per file: download -> verify -> upload -> delete, one file
@@ -969,13 +1247,17 @@ class TransferEngine:
                 text = m.text
                 if not text:
                     continue
-                sent = await client.send_message(
-                    cfg.dest_entity,
-                    text,
-                    formatting_entities=m.entities,
-                    parse_mode=None,
-                    reply_to=self._reply_to(m, reply_map),
-                    silent=cfg.silent,
+                sent = await self._guard(
+                    self._client.send_message(
+                        cfg.dest_entity,
+                        text,
+                        formatting_entities=m.entities,
+                        parse_mode=None,
+                        reply_to=self._reply_to(m, reply_map),
+                        silent=cfg.silent,
+                    ),
+                    timeout=config.OP_TIMEOUT,
+                    opname=f"send text msg={m.id}",
                 )
                 reply_map[m.id] = sent.id
             return
@@ -999,10 +1281,12 @@ class TransferEngine:
                 if is_album:
                     pairs: list = []
                     for m in media_msgs:
-                        path = await self._download_one(client, m, temp_paths)
+                        path = await self._download_one(m, temp_paths)
                         if path:
                             pairs.append((m, path))
                     if pairs:
+                        if not await self._pause_gate(None, None):
+                            raise _Abort()
                         log.info(
                             "uploading album of %d file(s) to %s",
                             len(pairs), cfg.dest_name or cfg.dest_entity.id,
@@ -1011,12 +1295,17 @@ class TransferEngine:
                             _msg_filename(pairs[0][0]) or "album", "Uploading", "up"
                         )
                         self._file_up = None
-                        sent = await client.send_file(
-                            cfg.dest_entity,
-                            [p for _, p in pairs],
-                            caption=caption,
-                            silent=cfg.silent,
-                            progress_callback=up_cb,
+                        sent = await self._guard(
+                            self._client.send_file(
+                                cfg.dest_entity,
+                                [p for _, p in pairs],
+                                caption=caption,
+                                silent=cfg.silent,
+                                progress_callback=up_cb,
+                            ),
+                            progress=self._up_progress,
+                            stall_timeout=config.STALL_TIMEOUT,
+                            opname=f"upload album ({len(pairs)} files)",
                         )
                         if isinstance(sent, list) and len(sent) == len(pairs):
                             for (m, _), s in zip(pairs, sent):
@@ -1026,24 +1315,31 @@ class TransferEngine:
                                 reply_map[m.id] = sent.id
                 else:
                     for m in media_msgs:
+                        if not await self._pause_gate(None, None):
+                            raise _Abort()
                         self._file_dl = None
                         self._file_up = None
-                        path = await self._download_one(client, m, temp_paths)
+                        path = await self._download_one(m, temp_paths)
                         if not path:
                             continue
                         up_cb = self._file_progress_cb(
                             _msg_filename(m) or f"message_{m.id}", "Uploading", "up"
                         )
                         self._file_up = None
-                        sent = await client.send_file(
-                            cfg.dest_entity,
-                            path,
-                            caption=caption,
-                            formatting_entities=m.entities,
-                            parse_mode=None,
-                            reply_to=self._reply_to(m, reply_map),
-                            silent=cfg.silent,
-                            progress_callback=up_cb,
+                        sent = await self._guard(
+                            self._client.send_file(
+                                cfg.dest_entity,
+                                path,
+                                caption=caption,
+                                formatting_entities=m.entities,
+                                parse_mode=None,
+                                reply_to=self._reply_to(m, reply_map),
+                                silent=cfg.silent,
+                                progress_callback=up_cb,
+                            ),
+                            progress=self._up_progress,
+                            stall_timeout=config.STALL_TIMEOUT,
+                            opname=f"upload msg={m.id}",
                         )
                         reply_map[m.id] = sent.id
                         log.info(
@@ -1051,13 +1347,17 @@ class TransferEngine:
                             m.id, os.path.getsize(path) / (1024 * 1024),
                         )
             for m in text_msgs:
-                sent = await client.send_message(
-                    cfg.dest_entity,
-                    m.text,
-                    formatting_entities=m.entities,
-                    parse_mode=None,
-                    reply_to=self._reply_to(m, reply_map),
-                    silent=cfg.silent,
+                sent = await self._guard(
+                    self._client.send_message(
+                        cfg.dest_entity,
+                        m.text,
+                        formatting_entities=m.entities,
+                        parse_mode=None,
+                        reply_to=self._reply_to(m, reply_map),
+                        silent=cfg.silent,
+                    ),
+                    timeout=config.OP_TIMEOUT,
+                    opname=f"send text msg={m.id}",
                 )
                 reply_map[m.id] = sent.id
         finally:
@@ -1067,6 +1367,10 @@ class TransferEngine:
                 except OSError:
                     pass
             temp_paths.clear()
+
+
+class _Paused(Exception):
+    """Internal: pause interrupted the current op; item is retried on resume."""
 
 
 
@@ -1109,6 +1413,26 @@ class _Abort(Exception):
 
 class _SkipCurrent(Exception):
     """Internal: skip only the currently processed message, then continue."""
+
+
+class _BoundedIter:
+    """Async wrapper that imposes a per-step timeout on an async iterator.
+
+    ``collect_ids`` uses this so a hung source chat can never block message
+    scanning forever: every ``__anext__`` is awaited under a hard deadline.
+    """
+
+    def __init__(self, anext: Callable[[], Awaitable]):
+        self._anext = anext
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return await self._anext()
+        except asyncio.TimeoutError:
+            raise StopAsyncIteration from None
 
 
 engine = TransferEngine()

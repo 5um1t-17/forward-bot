@@ -474,7 +474,12 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
     }
     store.progress[uid] = snap
 
-    async def render(force: bool = False) -> None:
+    async def _do_edit(force: bool = False) -> None:
+        """Perform one throttled message edit, bounded by ``EDIT_TIMEOUT``.
+
+        A slow bot edit can never stall anything: it is awaited under a hard
+        timeout and cancelled if the network wedges.
+        """
         current = store.progress.get(uid)
         if current is None or not current.get("running"):
             return
@@ -484,19 +489,50 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
                 return
             current["last_edit"] = now_t
             try:
-                await bot.edit_message(
-                    uid,
-                    current["progress_msg_id"],
-                    text.progress_text(current),
-                    buttons=keyboards.running_keyboard(bool(current.get("paused"))),
-                    parse_mode="html",
+                await asyncio.wait_for(
+                    bot.edit_message(
+                        uid,
+                        current["progress_msg_id"],
+                        text.progress_text(current),
+                        buttons=keyboards.running_keyboard(bool(current.get("paused"))),
+                        parse_mode="html",
+                    ),
+                    timeout=config.EDIT_TIMEOUT,
                 )
-            except (MessageNotModifiedError, MessageIdInvalidError):
+            except (MessageNotModifiedError, MessageIdInvalidError, asyncio.TimeoutError):
                 pass
             except Exception:
                 log.debug("progress edit failed", exc_info=True)
 
+    async def render(force: bool = False) -> None:
+        """Awaitable bounded edit; used by the button handlers and updater."""
+        await _do_edit(force=force)
+
+    async def schedule_render(force: bool = False) -> None:
+        """Fire-and-forget bounded edit, coalesced to one pending task.
+
+        The engine's ``progress_cb`` uses this so a slow bot edit can never
+        block the transfer loop (the root cause of the freeze-on-Render bug).
+        """
+        current = store.progress.get(uid)
+        if current is None or not current.get("running"):
+            return
+        if current.get("render_pending"):
+            return
+        current["render_pending"] = True
+
+        async def _bounded() -> None:
+            try:
+                await _do_edit(force=force)
+            finally:
+                cur = store.progress.get(uid)
+                if cur is not None:
+                    cur["render_pending"] = False
+
+        asyncio.create_task(_bounded())
+
     snap["render"] = render
+    snap["render_pending"] = False
 
     async def updater() -> None:
         while store.progress.get(uid, {}).get("running"):
@@ -516,13 +552,10 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         changed = done != current.get("_done", 0)
         current.update({k: v for k, v in state.items() if k != "render"})
         current["_done"] = done
-        # immediate refresh after a message completes / is skipped, or a 2s
-        # cadence while a single file is being transferred
+        # immediate refresh after a message completes / is skipped / pause
+        # toggles; throttled + coalesced so the engine never blocks on an edit
         if changed or state.get("paused"):
-            try:
-                await render(force=time.monotonic() - current.get("last_edit", 0.0) >= 0.5)
-            except Exception:
-                log.debug("immediate render failed", exc_info=True)
+            await schedule_render(force=True)
 
     log_id = await db.add_log(
         {
@@ -539,7 +572,23 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
     )
 
     try:
-        result = await engine_obj.run(client=await client_pool.get(uid, cfg.sid), cfg=cfg, progress_cb=progress_cb)
+        client = await client_pool.get(uid, cfg.sid)
+
+        async def refresh_client():
+            # Rebuild the account client after repeated network errors so a
+            # dead MTProto connection self-heals mid-run.
+            try:
+                return await client_pool.refresh(uid, cfg.sid)
+            except Exception as exc:
+                log.warning("client refresh failed for user %s: %s", uid, exc)
+                return None
+
+        result = await engine_obj.run(
+            client=client,
+            cfg=cfg,
+            progress_cb=progress_cb,
+            refresh_client=refresh_client,
+        )
     finally:
         store.running.pop(uid, None)
         update_task.cancel()
