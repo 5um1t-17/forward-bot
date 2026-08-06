@@ -15,6 +15,10 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
+    # StreamHandler -> stdout is what Render's dashboard captures. The file
+    # handler below is a convenience for local runs; on Render the container
+    # filesystem is ephemeral and is wiped on every deploy, so the dashboard
+    # stdout is the authoritative log source.
     console = logging.StreamHandler()
     console.setFormatter(fmt)
     root.addHandler(console)

@@ -165,11 +165,14 @@ async def _next_to_dest(bot, event, uid: int) -> bool:
 
 
 async def _fetch_dest_dialogs(uid: int) -> list[dict]:
+    log.info("dest step: fetching dialogs for user %s", uid)
     sid = await asyncio.wait_for(db.get_active_sid(uid), timeout=5.0)
     if not sid:
+        log.warning("dest step: no active session for user %s", uid)
         return []
     async with asyncio.timeout(config.CLIENT_CONNECT_TIMEOUT + 5):
         client = await client_pool.get(uid, sid)
+    log.info("dest step: got client for user %s", uid)
     # A pooled client can report connected while its MTProto link is dead;
     # verify with a cheap RPC and rebuild before spending time on get_dialogs,
     # so a half-dead connection can never hang the destination step.
@@ -178,7 +181,9 @@ async def _fetch_dest_dialogs(uid: int) -> list[dict]:
     if not await client_alive(client, timeout=5.0):
         log.warning("pooled client for user %s is unresponsive; rebuilding", uid)
         client = await client_pool.refresh(uid, sid)
-    return await fetch_sendable_dialogs(client, limit=200)
+    dialogs = await fetch_sendable_dialogs(client, limit=200)
+    log.info("dest step: found %d dialogs for user %s", len(dialogs), uid)
+    return dialogs
 
 
 async def _ask_dest(bot, event, uid: int) -> bool:
@@ -220,6 +225,7 @@ async def _edit_or_send(bot, event, uid: int, msg: str, kb) -> None:
 
 
 async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
+    log.info("dest step: entering _do_ask_dest for user %s", uid)
     await edit(event, "⏳ Loading destination chats...", None)
     try:
         async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT + 20):
@@ -233,8 +239,10 @@ async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
         await _edit_or_send(bot, event, uid, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
         return
     if not wiz.dialogs:
+        log.warning("dest step: no groups/channels for user %s", uid)
         await _edit_or_send(bot, event, uid, "⚠️ No groups/channels found in this account.\n\nYou can still enter the destination manually.", keyboards.dest_manual_keyboard())
         return
+    log.info("dest step: showing %d dialogs for user %s", len(wiz.dialogs), uid)
     await _edit_or_send(bot, event, uid, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
 
 

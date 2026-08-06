@@ -21,6 +21,30 @@ from bot.state import store
 log = logging.getLogger("bot.main")
 
 
+def build_id() -> str:
+    """Short identifier of the running code for log correlation.
+
+    Falls back to the Git ref/commit when inside a checkout, otherwise to a
+    build marker. Render deployments build from the pushed commit, so this lets
+    us confirm the running instance actually contains the destination fixes.
+    """
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:  # noqa: BLE001 - best effort
+        pass
+    return "unknown-build"
+
+
 _COMMANDS = {
     "/transfer": commands.cmd_transfer,
     "/accounts": commands.cmd_accounts,
@@ -142,6 +166,7 @@ def register_handlers(bot: TelegramClient) -> None:
             user = await db.get_user(uid)
             await event.edit(text.menu_text(user), buttons=keyboards.main_menu(), parse_mode="html")
             return
+        log.info("callback uid=%s data=%s", uid, data)
         for handler in (accounts.handle, transfer.handle, jobs.handle, settings_handler.handle, stats.handle):
             try:
                 if await handler(bot, event, data):
@@ -152,8 +177,6 @@ def register_handlers(bot: TelegramClient) -> None:
             await event.answer()
         except Exception:
             pass
-
-
 async def _cancel(bot, event, uid: int) -> None:
     store.set_pending(uid, None)
     store.reset_transfer(uid)
@@ -268,6 +291,8 @@ async def main() -> None:
 
     await db.init()
     log.info("Connected to MongoDB at %s/%s", config.MONGO_URI, config.MONGO_DB)
+    log.info("build=%s", build_id())
+    log.info("FETCH_DIALOGS_TIMEOUT=%s CLIENT_CONNECT_TIMEOUT=%s", config.FETCH_DIALOGS_TIMEOUT, config.CLIENT_CONNECT_TIMEOUT)
 
     from bot.transfer_engine import TransferEngine
 
