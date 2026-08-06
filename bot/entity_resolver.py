@@ -172,25 +172,29 @@ async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> li
     dialogs: list[dict] = []
 
     async def _collect() -> None:
-        async for dialog in client.get_dialogs(limit=limit):
-            try:
-                entity = dialog.entity
-                if not isinstance(entity, (Channel, Chat)):
-                    continue
-                if isinstance(entity, Channel):
-                    if entity.broadcast:
-                        # channel: requires admin rights to post
-                        if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                            continue
+        try:
+            dl = await client.get_dialogs(limit=limit)
+            for dialog in dl:
+                try:
+                    entity = dialog.entity
+                    if not isinstance(entity, (Channel, Chat)):
+                        continue
+                    if isinstance(entity, Channel):
+                        if entity.broadcast:
+                            if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
+                                continue
                     elif getattr(entity, "read_only", False):
-                        # read-only supergroup
                         if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
                             continue
-                title = dialog.name or str(entity.id)
-            except Exception as exc:  # noqa: BLE001 - skip one bad dialog
-                log.debug("skipping dialog in fetch_sendable_dialogs: %s", exc)
-                continue
-            dialogs.append({"id": entity.id, "title": title})
+                    title = dialog.name or str(entity.id)
+                except Exception as exc:  # noqa: BLE001 - skip one bad dialog
+                    log.debug("skipping dialog in fetch_sendable_dialogs: %s", exc)
+                    continue
+                dialogs.append({"id": entity.id, "title": title})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("fetch_sendable_dialogs collection error: %s", exc)
 
     try:
         await asyncio.wait_for(_collect(), timeout=config.FETCH_DIALOGS_TIMEOUT)

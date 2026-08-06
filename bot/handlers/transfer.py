@@ -164,17 +164,21 @@ async def _next_to_dest(bot, event, uid: int) -> bool:
     return await _ask_dest(bot, event, uid)
 
 
+async def _fetch_dest_dialogs(uid: int) -> list[dict]:
+    sid = await db.get_active_sid(uid)
+    client = await client_pool.get(uid, sid)
+    return await fetch_sendable_dialogs(client, limit=100)
+
+
 async def _ask_dest(bot, event, uid: int) -> bool:
     wiz = store.get_transfer(uid)
     store.set_pending(uid, None)
     wiz.dest_page = 0
     await edit(event, "⏳ Loading destination chats...", None)
     try:
-        sid = await db.get_active_sid(uid)
-        client = await client_pool.get(uid, sid)
         wiz.dialogs = await asyncio.wait_for(
-            fetch_sendable_dialogs(client, limit=100),
-            timeout=config.FETCH_DIALOGS_TIMEOUT,
+            _fetch_dest_dialogs(uid),
+            timeout=config.FETCH_DIALOGS_TIMEOUT + 5,
         )
     except asyncio.TimeoutError:
         log.warning("destination dialog fetch timed out for user %s", uid)
