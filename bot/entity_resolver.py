@@ -172,8 +172,7 @@ async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> li
     dialogs: list[dict] = []
 
     async def _collect() -> None:
-        dl = await client.get_dialogs(limit=limit)
-        for dialog in dl:
+        async for dialog in client.get_dialogs(limit=limit):
             try:
                 entity = dialog.entity
                 if not isinstance(entity, (Channel, Chat)):

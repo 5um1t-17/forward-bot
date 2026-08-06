@@ -169,12 +169,12 @@ async def _ask_dest(bot, event, uid: int) -> bool:
     store.set_pending(uid, None)
     wiz.dest_page = 0
     await edit(event, "⏳ Loading destination chats...", None)
-    timeout = config.FETCH_DIALOGS_TIMEOUT + config.CLIENT_CONNECT_TIMEOUT + 5
     try:
         sid = await db.get_active_sid(uid)
         client = await client_pool.get(uid, sid)
         wiz.dialogs = await asyncio.wait_for(
-            fetch_sendable_dialogs(client, limit=100), timeout=timeout
+            fetch_sendable_dialogs(client, limit=100),
+            timeout=config.FETCH_DIALOGS_TIMEOUT,
         )
     except asyncio.TimeoutError:
         log.warning("destination dialog fetch timed out for user %s", uid)

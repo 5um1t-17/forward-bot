@@ -49,7 +49,7 @@ class Config:
     DOWNLOAD_PARTS: int = int(os.getenv("DOWNLOAD_PARTS", "6"))
     DOWNLOAD_PARALLEL_MIN: int = int(os.getenv("DOWNLOAD_PARALLEL_MIN", str(1 * 1024 * 1024)))
 
-    FETCH_DIALOGS_TIMEOUT: int = int(os.getenv("FETCH_DIALOGS_TIMEOUT", "20"))
+    FETCH_DIALOGS_TIMEOUT: int = int(os.getenv("FETCH_DIALOGS_TIMEOUT", "60"))
 
     # Hard cap for connecting a user Telegram client (TCP + auth check). Keeps
     # a single slow/unreachable DC from hanging a callback forever.
