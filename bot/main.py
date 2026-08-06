@@ -180,16 +180,28 @@ async def _bot_alive(bot: TelegramClient, timeout: float | None = None) -> bool:
 
 
 async def _bot_health_watchdog(bot: TelegramClient) -> None:
-    """Ping the bot every interval; force a reconnect when it goes silent.
+    """Ping the bot every interval; force a reconnect only after repeated failures.
 
     ``run_until_disconnected`` only returns on a clean disconnect — if the
     MTProto link wedges without raising, the process would sit frozen forever.
     This watchdog detects that and breaks the loop so :func:`main` reconnects.
+
+    A single transient failure is tolerated because Telegram MTProto pings
+    can sporadically fail without the link being actually dead.
     """
+    consecutive_failures = 0
+    required_failures = 2
     while True:
         await asyncio.sleep(config.BOT_WATCHDOG_INTERVAL)
-        if not await _bot_alive(bot):
-            log.warning("bot health watchdog: bot unresponsive, forcing reconnect")
+        if await _bot_alive(bot):
+            consecutive_failures = 0
+            continue
+        consecutive_failures += 1
+        if consecutive_failures >= required_failures:
+            log.warning(
+                "bot health watchdog: %d consecutive failures, forcing reconnect",
+                consecutive_failures,
+            )
             try:
                 await bot.disconnect()
             except Exception:
