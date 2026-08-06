@@ -3,13 +3,39 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from telethon import events
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from bot.config import config
 
 log = logging.getLogger("bot.handlers")
+
+# Global "do not hit the bot API" window. Telegram rate-limits the bot account
+# (FloodWaitError) when it sends/edits too many messages in a short window
+# (e.g. a fast transfer updating the progress message every message). While a
+# flood wait is in force, every bot message operation would just fail again and
+# burn more quota, so we hold off until the window passes.
+_flood_until = 0.0
+_flood_lock = asyncio.Lock()
+
+
+async def note_flood(seconds: int | float | None) -> None:
+    """Record that Telegram demanded a flood wait of ``seconds``."""
+    if not seconds:
+        return
+    global _flood_until
+    async with _flood_lock:
+        _flood_until = max(_flood_until, time.monotonic() + float(seconds))
+
+
+def flood_remaining() -> float:
+    return max(0.0, _flood_until - time.monotonic())
+
+
+def flood_blocked() -> bool:
+    return time.monotonic() < _flood_until
 
 
 def is_admin(user_id: int) -> bool:
@@ -19,6 +45,9 @@ def is_admin(user_id: int) -> bool:
 async def answer(event: events.CallbackQuery.Event, text: str | None = None, alert: bool = False) -> None:
     try:
         await event.answer(text, alert=alert)
+    except FloodWaitError as exc:
+        log.warning("answer flood wait: %ss", exc.seconds)
+        await note_flood(exc.seconds)
     except Exception:
         log.debug("answer failed", exc_info=True)
 
@@ -32,6 +61,9 @@ async def edit(event: events.CallbackQuery.Event, text: str, kb=None, *, timeout
     original message is gone can use the return value to fall back to sending
     a fresh message instead of leaving the user stuck on stale UI.
     """
+    if flood_blocked():
+        log.info("edit skipped: bot flood-limited (%ds remaining)", int(flood_remaining()))
+        return False
     try:
         await asyncio.wait_for(
             event.edit(text, buttons=kb, parse_mode="html"),
@@ -42,6 +74,31 @@ async def edit(event: events.CallbackQuery.Event, text: str, kb=None, *, timeout
         log.debug("edit timed out for uid=%s", getattr(event, "sender_id", None))
     except MessageNotModifiedError:
         return True  # already shows the requested content
+    except FloodWaitError as exc:
+        log.warning("edit flood wait: %ss", exc.seconds)
+        await note_flood(exc.seconds)
     except Exception:
         log.warning("edit failed", exc_info=True)
     return False
+
+
+async def safe_send(bot, uid: int, text: str, kb=None, *, parse_mode: str = "html"):
+    """Send a fresh bot message, respecting the flood guard.
+
+    Returns the sent message object on success, or ``False`` if the message
+    could not be sent (flood-limited, network error, ...). While Telegram is
+    rate-limiting the bot account this returns ``False`` without attempting
+    the request, so a flood wait is never made worse by hammering the API.
+    """
+    if flood_blocked():
+        log.info("send skipped for uid=%s: bot flood-limited (%ds remaining)", uid, int(flood_remaining()))
+        return False
+    try:
+        return await bot.send_message(uid, text, buttons=kb, parse_mode=parse_mode)
+    except FloodWaitError as exc:
+        log.warning("send flood wait: %ss for uid=%s", exc.seconds, uid)
+        await note_flood(exc.seconds)
+        return False
+    except Exception:
+        log.warning("send failed for uid=%s", uid, exc_info=True)
+        return False

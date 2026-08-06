@@ -58,6 +58,13 @@ class Config:
     # How often the live progress message is refreshed (seconds).
     PROGRESS_REFRESH: float = float(os.getenv("PROGRESS_REFRESH", "2"))
 
+    # Minimum gap between two bot progress-message edits, even for "forced"
+    # edits after a message completes. A fast transfer would otherwise issue
+    # hundreds of editMessage calls a minute and Telegram escalates that into a
+    # long FloodWaitError blocking all bot messages (e.g. the destination chat
+    # list). 3s caps a transfer at 20 bot edits/min while staying responsive.
+    EDIT_MIN_INTERVAL: float = float(os.getenv("EDIT_MIN_INTERVAL", "3"))
+
     # FloodWait handling: a single wait is slept through up to MAX_FLOOD_SLEEP
     # seconds, but if the cumulative wait for one operation exceeds
     # MAX_FLOOD_WAIT the operation gives up (counted as failed) instead of

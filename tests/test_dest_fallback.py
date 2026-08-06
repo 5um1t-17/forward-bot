@@ -156,6 +156,29 @@ async def run():
     flat = [b.text for row in kb for b in row]
     assert "Dest Channel" in flat, flat
 
+    # 4) Flood-limited bot: edit and send must both be skipped, and the user
+    #    gets an alert instead of a silent stuck screen.
+    from bot.handlers import common as common_mod
+
+    original_note = common_mod.note_flood
+    await common_mod.note_flood(3600)  # pretend Telegram demanded a 1h wait
+    bot.sent.clear()
+    store.reset_transfer(1)
+    ev = FailingEditEvent(1)
+    await transfer._ask_dest(bot, ev, 1)
+    assert not bot.sent, "flood-limited bot must not attempt sends"
+    assert ev.answered, "flood-limited bot must alert the user"
+    common_mod._flood_until = 0.0
+    common_mod.note_flood = original_note
+
+    # 5) normal path again after the flood window has cleared
+    bot.sent.clear()
+    store.reset_transfer(1)
+    ev = NormalEvent(1)
+    await transfer._ask_dest(bot, ev, 1)
+    assert not bot.sent
+    assert ev.edited
+
     if db.client is not None:
         db.client.close()
     print("DEST FALLBACK TESTS PASSED")

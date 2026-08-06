@@ -7,7 +7,7 @@ import logging
 import time
 
 from telethon import events
-from telethon.errors import MessageNotModifiedError, MessageIdInvalidError
+from telethon.errors import FloodWaitError, MessageNotModifiedError, MessageIdInvalidError
 
 from bot import keyboards, text
 from bot.client_pool import client_pool
@@ -194,17 +194,20 @@ async def _ask_dest(bot, event, uid: int) -> bool:
         await _do_ask_dest(bot, event, uid, wiz)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        log.warning("_ask_dest failed: %s", exc)
+    except FloodWaitError as exc:
+        log.warning("_ask_dest flood wait: %ss", exc.seconds)
         try:
-            await bot.send_message(
-                uid,
-                "⚠️ Could not load your destination chats. Please try again.",
-                buttons=keyboards.dest_manual_keyboard(),
-                parse_mode="html",
+            await event.answer(
+                f"⚠️ Telegram is rate-limiting the bot. Please wait ~{int(exc.seconds // 60)} min and try again.",
+                alert=True,
             )
         except Exception:
-            log.debug("_ask_dest fallback message failed", exc_info=True)
+            log.debug("flood alert answer failed", exc_info=True)
+    except Exception as exc:
+        log.warning("_ask_dest failed: %s", exc)
+        from bot.handlers.common import safe_send
+
+        await safe_send(bot, uid, "⚠️ Could not load your destination chats. Please try again.", keyboards.dest_manual_keyboard())
     return True
 
 
@@ -216,12 +219,30 @@ async def _edit_or_send(bot, event, uid: int, msg: str, kb) -> None:
     not own). Falling back to a new message guarantees the user always sees
     the destination list / error instead of a stale "Loading..." screen.
     """
+    from bot.handlers.common import flood_blocked, flood_remaining, safe_send
+
     if await edit(event, msg, kb):
         return
-    try:
-        await bot.send_message(uid, msg, buttons=kb, parse_mode="html")
-    except Exception:
-        log.warning("send_message fallback failed for uid=%s", uid, exc_info=True)
+    if flood_blocked():
+        log.info("send fallback skipped: bot flood-limited (%ds remaining)", int(flood_remaining()))
+        try:
+            await event.answer(
+                f"⚠️ Telegram is rate-limiting the bot. Please try again in ~{int(flood_remaining() // 60)} min.",
+                alert=True,
+            )
+        except Exception:
+            log.debug("flood alert answer failed", exc_info=True)
+        return
+    if await safe_send(bot, uid, msg, kb):
+        return
+    if flood_blocked():
+        try:
+            await event.answer(
+                f"⚠️ Telegram is rate-limiting the bot. Please try again in ~{int(flood_remaining() // 60)} min.",
+                alert=True,
+            )
+        except Exception:
+            log.debug("flood alert answer failed", exc_info=True)
 
 
 async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
@@ -478,7 +499,11 @@ async def _run(bot, event, uid: int) -> bool:
     if cfg is None or not cfg.message_ids:
         await edit(event, "⚠️ No messages matched your filters / range.", keyboards.back_row())
         return True
-    await execute(bot, uid, cfg)
+    result = await execute(bot, uid, cfg)
+    if result.error and result.success == 0 and not result.cancelled:
+        from bot.handlers.common import safe_send
+
+        await safe_send(bot, uid, f"⚠️ {result.error}", None)
     return True
 
 
@@ -509,12 +534,27 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         "source_name": cfg.source_name,
         "dest_name": cfg.dest_name,
     }
-    progress_msg = await bot.send_message(
+    from bot.handlers.common import safe_send
+
+    progress_msg = await safe_send(
+        bot,
         uid,
         text.progress_text(init_state),
-        buttons=keyboards.running_keyboard(False),
-        parse_mode="html",
+        keyboards.running_keyboard(False),
     )
+    if progress_msg is False:
+        # Bot is flood-limited right now; do not start a transfer whose
+        # progress can never be shown.
+        store.running.pop(uid, None)
+        store.progress.pop(uid, None)
+        return TransferResult(
+            total=cfg.total_planned,
+            success=0,
+            skipped=0,
+            failed=0,
+            duration=0.0,
+            error="Telegram is rate-limiting the bot. Try again later.",
+        )
     engine_obj = TransferEngine()
     store.running[uid] = engine_obj
     snap = {
@@ -533,14 +573,23 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         """Perform one throttled message edit, bounded by ``EDIT_TIMEOUT``.
 
         A slow bot edit can never stall anything: it is awaited under a hard
-        timeout and cancelled if the network wedges.
+        timeout and cancelled if the network wedges. Edits are rate-limited to
+        at most one per ``EDIT_MIN_INTERVAL`` even when forced, because a fast
+        transfer (many messages/sec) otherwise hammers Telegram's bot API with
+        hundreds of edit calls a minute and triggers a long FloodWaitError that
+        blocks *all* bot messages (including the destination chat list).
         """
+        from bot.handlers.common import flood_blocked, flood_remaining, note_flood
+
         current = store.progress.get(uid)
         if current is None or not current.get("running"):
             return
+        if flood_blocked():
+            log.info("progress edit skipped: bot flood-limited (%ds remaining)", int(flood_remaining()))
+            return
         async with current["edit_lock"]:
             now_t = time.monotonic()
-            if not force and now_t - current["last_edit"] < config.PROGRESS_REFRESH:
+            if now_t - current["last_edit"] < config.EDIT_MIN_INTERVAL:
                 return
             current["last_edit"] = now_t
             try:
@@ -556,6 +605,9 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
                 )
             except (MessageNotModifiedError, MessageIdInvalidError, asyncio.TimeoutError):
                 pass
+            except FloodWaitError as exc:
+                log.warning("progress edit flood wait: %ss", exc.seconds)
+                await note_flood(exc.seconds)
             except Exception:
                 log.warning("progress edit failed for uid=%s msg=%s", uid, current.get("progress_msg_id"), exc_info=True)
 
