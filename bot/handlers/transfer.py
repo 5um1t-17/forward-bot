@@ -191,7 +191,32 @@ async def _ask_dest(bot, event, uid: int) -> bool:
         raise
     except Exception as exc:
         log.warning("_ask_dest failed: %s", exc)
+        try:
+            await bot.send_message(
+                uid,
+                "⚠️ Could not load your destination chats. Please try again.",
+                buttons=keyboards.dest_manual_keyboard(),
+                parse_mode="html",
+            )
+        except Exception:
+            log.debug("_ask_dest fallback message failed", exc_info=True)
     return True
+
+
+async def _edit_or_send(bot, event, uid: int, msg: str, kb) -> None:
+    """Edit the callback message; send a fresh message if it cannot be edited.
+
+    ``event.edit`` silently does nothing when the callback message is no
+    longer editable (deleted, or the click happened on a message the bot does
+    not own). Falling back to a new message guarantees the user always sees
+    the destination list / error instead of a stale "Loading..." screen.
+    """
+    if await edit(event, msg, kb):
+        return
+    try:
+        await bot.send_message(uid, msg, buttons=kb, parse_mode="html")
+    except Exception:
+        log.warning("send_message fallback failed for uid=%s", uid, exc_info=True)
 
 
 async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
@@ -201,16 +226,16 @@ async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
             wiz.dialogs = await _fetch_dest_dialogs(uid)
     except asyncio.TimeoutError:
         log.warning("destination dialog fetch timed out for user %s", uid)
-        await edit(event, text.dest_timeout_prompt(), keyboards.dest_manual_keyboard())
+        await _edit_or_send(bot, event, uid, text.dest_timeout_prompt(), keyboards.dest_manual_keyboard())
         return
     except Exception as exc:
         log.warning("dialogs failed: %s", exc)
-        await edit(event, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
+        await _edit_or_send(bot, event, uid, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
         return
     if not wiz.dialogs:
-        await edit(event, "⚠️ No groups/channels found in this account.\n\nYou can still enter the destination manually.", keyboards.dest_manual_keyboard())
+        await _edit_or_send(bot, event, uid, "⚠️ No groups/channels found in this account.\n\nYou can still enter the destination manually.", keyboards.dest_manual_keyboard())
         return
-    await edit(event, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
+    await _edit_or_send(bot, event, uid, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
 
 
 async def _ask_count(bot, event, uid: int) -> bool:
