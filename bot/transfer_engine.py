@@ -801,11 +801,7 @@ class TransferEngine:
                             )
                             task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
-<<<<<<< HEAD
-                                await task
-=======
                                 await asyncio.wait_for(task, timeout=5.0)
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                             raise asyncio.TimeoutError(
                                 f"{opname} stalled ({stall_timeout:.0f}s no progress)"
                             )
@@ -813,21 +809,13 @@ class TransferEngine:
                     log.warning("Watchdog: %s timed out after %ss", opname, timeout)
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
-<<<<<<< HEAD
-                        await task
-=======
                         await asyncio.wait_for(task, timeout=5.0)
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                     raise asyncio.TimeoutError(f"{opname} timed out after {timeout:.0f}s")
         finally:
             if not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-<<<<<<< HEAD
-                    await task
-=======
                     await asyncio.wait_for(task, timeout=5.0)
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
 
     def _dl_progress(self) -> int | None:
         return (self._file_dl or {}).get("done")
@@ -986,11 +974,7 @@ class TransferEngine:
                     return
 
         await self._with_retries(
-<<<<<<< HEAD
-            cfg, lambda: self._transfer(cfg, msgs, reply_map),
-=======
             cfg, lambda: self._transfer(cfg, msgs, reply_map, progress_cb, state_builder),
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
             skip_idx=skip_idx, progress_cb=progress_cb, state_builder=state_builder,
         )
 
@@ -1022,11 +1006,8 @@ class TransferEngine:
                 raise
             except _Paused:
                 raise
-<<<<<<< HEAD
-=======
             except _Stopped:
                 raise
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
             except FloodWaitError as exc:
                 if not cfg.handle_flood:
                     raise
@@ -1136,21 +1117,13 @@ class TransferEngine:
         return True
 
     # ------------------------------------------------------------------
-<<<<<<< HEAD
-    async def _transfer(self, cfg, msgs: list, reply_map: dict) -> None:
-=======
     async def _transfer(self, cfg, msgs: list, reply_map: dict, progress_cb=None, state_builder=None) -> None:
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
         if cfg.mode == "forward":
             await self._forward(cfg, msgs, reply_map)
         elif cfg.mode == "copy":
             await self._copy(cfg, msgs, reply_map)
         elif cfg.mode == "download":
-<<<<<<< HEAD
-            await self._download_transfer(cfg, msgs, reply_map)
-=======
             await self._download_transfer(cfg, msgs, reply_map, progress_cb, state_builder)
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
 
     async def _forward(self, cfg, msgs: list, reply_map: dict) -> None:
         ids = [m.id for m in msgs]
@@ -1298,11 +1271,7 @@ class TransferEngine:
             return sent.id
         return None
 
-<<<<<<< HEAD
-    async def _download_transfer(self, cfg, msgs: list, reply_map: dict) -> None:
-=======
     async def _download_transfer(self, cfg, msgs: list, reply_map: dict, progress_cb=None, state_builder=None) -> None:
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
         """Strictly sequential download & re-upload of a single item.
 
         Lifecycle per file: download -> verify -> upload -> delete, one file
@@ -1361,11 +1330,7 @@ class TransferEngine:
                         if path:
                             pairs.append((m, path))
                     if pairs:
-<<<<<<< HEAD
-                        if not await self._pause_gate(None, None):
-=======
                         if not await self._pause_gate(progress_cb, state_builder):
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                             raise _Abort()
                         log.info(
                             "uploading album of %d file(s) to %s",
@@ -1395,11 +1360,7 @@ class TransferEngine:
                                 reply_map[m.id] = sent.id
                 else:
                     for m in media_msgs:
-<<<<<<< HEAD
-                        if not await self._pause_gate(None, None):
-=======
                         if not await self._pause_gate(progress_cb, state_builder):
->>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                             raise _Abort()
                         self._file_dl = None
                         self._file_up = None
