@@ -45,14 +45,36 @@ class ClientPool:
             self._locks[key] = lock
         return lock
 
+    async def _is_usable(self, client, timeout: float = 4.0) -> bool:
+        """True if ``client`` answers a lightweight RPC.
+
+        ``is_connected()`` only reflects the last socket state — a half-dead
+        MTProto link can still report connected. Doing a real round-trip before
+        handing a cached client back prevents every caller from silently
+        hanging on a dead connection (e.g. destination chat loading).
+        """
+        try:
+            await asyncio.wait_for(client(GetNearestDcRequest()), timeout=timeout)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return False
+
     async def get(self, user_id: int, sid: str, timeout: float | None = None):
         key = (user_id, sid)
         client = self._clients.get(key)
-        if client is not None and client.is_connected():
+        if client is not None and client.is_connected() and await self._is_usable(client):
             return client
+        if client is not None:
+            self._clients.pop(key, None)
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
+            except Exception:
+                pass
         async with self._lock(key):
             client = self._clients.get(key)
-            if client is not None and client.is_connected():
+            if client is not None and client.is_connected() and await self._is_usable(client):
                 return client
             if client is not None:
                 self._clients.pop(key, None)

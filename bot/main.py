@@ -95,10 +95,13 @@ def register_handlers(bot: TelegramClient) -> None:
 
         pending = store.pending(uid)
         if pending:
-            if await accounts.handle_pending(bot, event, pending):
-                return
-            if await transfer.handle_pending(bot, event, pending):
-                return
+            try:
+                if await accounts.handle_pending(bot, event, pending):
+                    return
+                if await transfer.handle_pending(bot, event, pending):
+                    return
+            except Exception:
+                log.exception("pending handler error for uid=%s kind=%s", uid, pending)
             store.set_pending(uid, None)
 
         try:

@@ -158,56 +158,74 @@ def _to_resolved(entity, input_type: str) -> Resolved:
     return Resolved(entity=entity, title=title, chat_id=entity.id, input_type=input_type)
 
 
-async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 100) -> list[dict]:
-    """Group/channel dialogs the account can (likely) post to.
+def _can_post(entity) -> bool:
+    """Best-effort check whether the account can post in this chat.
 
-    Uses a single bounded ``get_dialogs`` call (one network round trip, at most
-    ``limit`` dialogs) wrapped in a hard timeout, so the wizard can never hang
-    here even on accounts with thousands of chats or on slow networks. A bad
-    dialog is skipped instead of aborting the whole scan.
+    Broadcast channels only accept posts from admins/creators; groups and
+    supergroups accept posts from regular members unless they are read-only.
+    ``get_dialogs`` may not populate ``admin_rights`` for every entry, so this
+    is a hint for sorting (postable first), not a hard filter.
+    """
+    from telethon.tl.types import Channel
+
+    is_admin = bool(
+        getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None
+    )
+    if isinstance(entity, Channel):
+        if entity.broadcast:
+            return is_admin
+        return True  # supergroup: members can post
+    return not getattr(entity, "read_only", False) or is_admin
+
+
+async def fetch_sendable_dialogs(client: TelegramClient, limit: int = 200) -> list[dict]:
+    """Group/channel dialogs the account is a member of.
+
+    Uses a single bounded ``get_dialogs`` call (one network round trip) wrapped
+    in a hard timeout, so the wizard can never hang here even on accounts with
+    thousands of chats or on slow networks. A bad dialog is skipped instead of
+    aborting the whole scan.
+
+    Real failures are *not* swallowed: a timeout raises ``TimeoutError`` and a
+    network/RPC error propagates, so the caller can show the actual reason to
+    the user instead of a misleading "no chats found".
     """
     from bot.config import config
     from telethon.tl.types import Channel, Chat
 
-    dialogs: list[dict] = []
-
-    async def _collect() -> None:
-        try:
-            dl = await client.get_dialogs(limit=limit)
-            for dialog in dl:
-                try:
-                    entity = dialog.entity
-                    if not isinstance(entity, (Channel, Chat)):
-                        continue
-                    if isinstance(entity, Channel):
-                        if entity.broadcast:
-                            if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                                continue
-                    elif getattr(entity, "read_only", False):
-                        if not (getattr(entity, "creator", False) or getattr(entity, "admin_rights", None) is not None):
-                            continue
-                    title = dialog.name or str(entity.id)
-                except Exception as exc:  # noqa: BLE001 - skip one bad dialog
-                    log.debug("skipping dialog in fetch_sendable_dialogs: %s", exc)
+    async def _collect() -> list[dict]:
+        dl = await client.get_dialogs(limit=limit)
+        out: list[dict] = []
+        for dialog in dl:
+            try:
+                entity = dialog.entity
+                if not isinstance(entity, (Channel, Chat)):
                     continue
-                dialogs.append({"id": entity.id, "title": title})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.debug("fetch_sendable_dialogs collection error: %s", exc)
+                title = dialog.name or getattr(entity, "title", None) or str(entity.id)
+            except Exception as exc:  # noqa: BLE001 - skip one bad dialog
+                log.debug("skipping dialog in fetch_sendable_dialogs: %s", exc)
+                continue
+            out.append({"id": entity.id, "title": title, "postable": _can_post(entity)})
+        return out
 
     try:
-        await asyncio.wait_for(_collect(), timeout=config.FETCH_DIALOGS_TIMEOUT)
+        dialogs = await asyncio.wait_for(
+            _collect(), timeout=config.FETCH_DIALOGS_TIMEOUT
+        )
     except asyncio.TimeoutError:
         log.warning("fetch_sendable_dialogs timed out after %ss", config.FETCH_DIALOGS_TIMEOUT)
-    except Exception as exc:
-        log.warning("fetch_sendable_dialogs failed: %s", exc)
+        raise TimeoutError(
+            f"Telegram did not respond while loading your chats "
+            f"(waited {config.FETCH_DIALOGS_TIMEOUT}s)."
+        ) from None
+    except asyncio.CancelledError:
+        raise
 
     seen: set[int] = set()
-    unique = []
+    unique: list[dict] = []
     for d in dialogs:
         if d["id"] not in seen:
             seen.add(d["id"])
             unique.append(d)
-    unique.sort(key=lambda d: d["title"].lower())
+    unique.sort(key=lambda d: (not d.get("postable", True), d["title"].lower()))
     return unique

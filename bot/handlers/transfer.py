@@ -165,11 +165,20 @@ async def _next_to_dest(bot, event, uid: int) -> bool:
 
 
 async def _fetch_dest_dialogs(uid: int) -> list[dict]:
-    sid = await asyncio.wait_for(db.get_active_sid(uid), timeout=10.0)
+    sid = await asyncio.wait_for(db.get_active_sid(uid), timeout=5.0)
     if not sid:
         return []
-    client = await client_pool.get(uid, sid)
-    return await fetch_sendable_dialogs(client, limit=100)
+    async with asyncio.timeout(config.CLIENT_CONNECT_TIMEOUT + 5):
+        client = await client_pool.get(uid, sid)
+    # A pooled client can report connected while its MTProto link is dead;
+    # verify with a cheap RPC and rebuild before spending time on get_dialogs,
+    # so a half-dead connection can never hang the destination step.
+    from bot.client_pool import client_alive
+
+    if not await client_alive(client, timeout=5.0):
+        log.warning("pooled client for user %s is unresponsive; rebuilding", uid)
+        client = await client_pool.refresh(uid, sid)
+    return await fetch_sendable_dialogs(client, limit=200)
 
 
 async def _ask_dest(bot, event, uid: int) -> bool:
@@ -177,12 +186,9 @@ async def _ask_dest(bot, event, uid: int) -> bool:
     store.set_pending(uid, None)
     wiz.dest_page = 0
     try:
-        await asyncio.wait_for(
-            _do_ask_dest(bot, event, uid, wiz),
-            timeout=config.FETCH_DIALOGS_TIMEOUT + 15,
-        )
-    except asyncio.TimeoutError:
-        log.warning("_ask_dest overall timed out for user %s", uid)
+        await _do_ask_dest(bot, event, uid, wiz)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         log.warning("_ask_dest failed: %s", exc)
     return True
@@ -191,7 +197,8 @@ async def _ask_dest(bot, event, uid: int) -> bool:
 async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
     await edit(event, "⏳ Loading destination chats...", None)
     try:
-        wiz.dialogs = await _fetch_dest_dialogs(uid)
+        async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT + 20):
+            wiz.dialogs = await _fetch_dest_dialogs(uid)
     except asyncio.TimeoutError:
         log.warning("destination dialog fetch timed out for user %s", uid)
         await edit(event, text.dest_timeout_prompt(), keyboards.dest_manual_keyboard())
@@ -201,7 +208,7 @@ async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
         await edit(event, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
         return
     if not wiz.dialogs:
-        await edit(event, "⚠️ No groups/channels found where you can post.", keyboards.dest_manual_keyboard())
+        await edit(event, "⚠️ No groups/channels found in this account.\n\nYou can still enter the destination manually.", keyboards.dest_manual_keyboard())
         return
     await edit(event, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
 
@@ -518,33 +525,6 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
                 pass
             except Exception:
                 log.warning("progress edit failed for uid=%s msg=%s", uid, current.get("progress_msg_id"), exc_info=True)
-
-    async def render(force: bool = False) -> None:
-        """Awaitable bounded edit; used by the button handlers and updater."""
-        await _do_edit(force=force)
-
-    async def schedule_render(force: bool = False) -> None:
-        """Fire-and-forget bounded edit, coalesced to one pending task.
-
-        The engine's ``progress_cb`` uses this so a slow bot edit can never
-        block the transfer loop (the root cause of the freeze-on-Render bug).
-        """
-        current = store.progress.get(uid)
-        if current is None or not current.get("running"):
-            return
-        if current.get("render_pending"):
-            return
-        current["render_pending"] = True
-
-        async def _bounded() -> None:
-            try:
-                await _do_edit(force=force)
-            finally:
-                cur = store.progress.get(uid)
-                if cur is not None:
-                    cur["render_pending"] = False
-
-        asyncio.create_task(_bounded())
 
     async def render(force: bool = False) -> None:
         """Awaitable bounded edit; used by the button handlers and updater."""
