@@ -1007,11 +1007,16 @@ class TransferEngine:
                             "uploading album of %d file(s) to %s",
                             len(pairs), cfg.dest_name or cfg.dest_entity.id,
                         )
+                        up_cb = self._file_progress_cb(
+                            _msg_filename(pairs[0][0]) or "album", "Uploading", "up"
+                        )
+                        self._file_up = None
                         sent = await client.send_file(
                             cfg.dest_entity,
                             [p for _, p in pairs],
                             caption=caption,
                             silent=cfg.silent,
+                            progress_callback=up_cb,
                         )
                         if isinstance(sent, list) and len(sent) == len(pairs):
                             for (m, _), s in zip(pairs, sent):
@@ -1021,9 +1026,15 @@ class TransferEngine:
                                 reply_map[m.id] = sent.id
                 else:
                     for m in media_msgs:
+                        self._file_dl = None
+                        self._file_up = None
                         path = await self._download_one(client, m, temp_paths)
                         if not path:
                             continue
+                        up_cb = self._file_progress_cb(
+                            _msg_filename(m) or f"message_{m.id}", "Uploading", "up"
+                        )
+                        self._file_up = None
                         sent = await client.send_file(
                             cfg.dest_entity,
                             path,
@@ -1032,6 +1043,7 @@ class TransferEngine:
                             parse_mode=None,
                             reply_to=self._reply_to(m, reply_map),
                             silent=cfg.silent,
+                            progress_callback=up_cb,
                         )
                         reply_map[m.id] = sent.id
                         log.info(

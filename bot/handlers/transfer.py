@@ -379,8 +379,11 @@ async def _build_cfg(uid: int, wiz: TransferWizard) -> TransferConfig | None:
     if not sid:
         return None
     client = await client_pool.get(uid, sid)
-    src_entity = await client.get_entity(wiz.source["id"])
-    dst_entity = await client.get_entity(wiz.dest["id"])
+    try:
+        src_entity = await asyncio.wait_for(client.get_entity(wiz.source["id"]), timeout=30)
+        dst_entity = await asyncio.wait_for(client.get_entity(wiz.dest["id"]), timeout=30)
+    except asyncio.TimeoutError:
+        raise ValueError("Timed out resolving source or destination. Check the link/username/ID and try again.")
     settings = await db.get_settings(uid)
     if wiz.count_mode == "latest":
         ids = await engine.collect_ids(client, src_entity, wiz.count, None, None, wiz.filter_type)
