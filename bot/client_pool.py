@@ -87,6 +87,10 @@ class ClientPool:
                     pass
                 raise ValueError("Telegram connection timed out — try again in a moment")
             if not authorized:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 raise ValueError("Session is no longer authorized — please re-add the account")
             self._clients[key] = client
             await db.touch_session(sid)

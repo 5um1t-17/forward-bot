@@ -458,6 +458,9 @@ class TransferEngine:
         if progress_cb is not None:
             beat_task = asyncio.create_task(self._heartbeat(progress_cb, state_builder))
 
+        watchdog_task: asyncio.Task | None = None
+        watchdog_task = asyncio.create_task(self._run_watchdog())
+
         reply_map: dict[int, int] = {}
         ids = sorted(cfg.message_ids)
         aborted = False
@@ -505,6 +508,10 @@ class TransferEngine:
                     result.skipped += item["count"]
                     i += 1
                     continue
+                except _Stopped:
+                    log.info("Worker stopped mid-item (index %d)", i)
+                    aborted = True
+                    break
                 except _Abort:
                     aborted = True
                     break
@@ -535,12 +542,13 @@ class TransferEngine:
             result.error = str(exc)
         finally:
             self._stop.set()
-            if beat_task is not None:
-                beat_task.cancel()
-                try:
-                    await beat_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            for task in (watchdog_task, beat_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
         result.duration = time.monotonic() - start
         log.info(
@@ -646,6 +654,32 @@ class TransferEngine:
             except Exception:  # noqa: BLE001
                 log.debug("heartbeat progress update failed", exc_info=True)
 
+    async def _run_watchdog(self) -> None:
+        """Abort the run if the engine hasn't advanced to a new item for too long.
+
+        Monitors ``_current_index`` every 30s. If the index hasn't changed for
+        more than ``MAX_ITEM_RETRY_SECONDS``, the engine is considered stuck
+        and ``request_stop()`` is called so the caller can recover.
+        """
+        stall_limit = config.MAX_ITEM_RETRY_SECONDS
+        check_interval = 30.0
+        last_index = self._current_index
+        while True:
+            await asyncio.sleep(check_interval)
+            if self._stop.is_set():
+                break
+            if self._current_index != last_index:
+                last_index = self._current_index
+                continue
+            if time.monotonic() - self._item_deadline > stall_limit:
+                log.warning(
+                    "Watchdog: engine stuck on item %d for >%.0fs, forcing stop",
+                    self._current_index,
+                    stall_limit,
+                )
+                self.request_stop()
+                break
+
     @staticmethod
     def cleanup_stale_temp(max_age: float = 3600.0) -> int:
         """Remove leftover ``fwd_*`` temp files older than ``max_age`` seconds.
@@ -689,7 +723,10 @@ class TransferEngine:
                 state = state_builder()
                 state["operation"] = "Paused"
                 state["paused"] = True
-                await progress_cb(state)
+                try:
+                    await progress_cb(state)
+                except Exception:
+                    pass
             await asyncio.sleep(1.0)
         self._operation = _verb(self._mode) if self._mode else "Transferring"
         log.info("Worker resumed")
@@ -731,11 +768,17 @@ class TransferEngine:
                 if task in done:
                     return task.result()
                 now = time.monotonic()
+                if self._stop.is_set():
+                    log.info("Stop detected in %s, cancelling", opname)
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=5.0)
+                    raise _Stopped()
                 if self._pause_evt.is_set():
                     log.info("Pause interrupted %s, cancelling", opname)
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                        await asyncio.wait_for(task, timeout=5.0)
                     raise _Paused()
                 if progress is not None:
                     cur = progress()
@@ -758,7 +801,11 @@ class TransferEngine:
                             )
                             task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
+<<<<<<< HEAD
                                 await task
+=======
+                                await asyncio.wait_for(task, timeout=5.0)
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                             raise asyncio.TimeoutError(
                                 f"{opname} stalled ({stall_timeout:.0f}s no progress)"
                             )
@@ -766,13 +813,21 @@ class TransferEngine:
                     log.warning("Watchdog: %s timed out after %ss", opname, timeout)
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
+<<<<<<< HEAD
                         await task
+=======
+                        await asyncio.wait_for(task, timeout=5.0)
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                     raise asyncio.TimeoutError(f"{opname} timed out after {timeout:.0f}s")
         finally:
             if not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
+<<<<<<< HEAD
                     await task
+=======
+                    await asyncio.wait_for(task, timeout=5.0)
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
 
     def _dl_progress(self) -> int | None:
         return (self._file_dl or {}).get("done")
@@ -931,7 +986,11 @@ class TransferEngine:
                     return
 
         await self._with_retries(
+<<<<<<< HEAD
             cfg, lambda: self._transfer(cfg, msgs, reply_map),
+=======
+            cfg, lambda: self._transfer(cfg, msgs, reply_map, progress_cb, state_builder),
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
             skip_idx=skip_idx, progress_cb=progress_cb, state_builder=state_builder,
         )
 
@@ -963,6 +1022,11 @@ class TransferEngine:
                 raise
             except _Paused:
                 raise
+<<<<<<< HEAD
+=======
+            except _Stopped:
+                raise
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
             except FloodWaitError as exc:
                 if not cfg.handle_flood:
                     raise
@@ -1063,7 +1127,7 @@ class TransferEngine:
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if self._stop.is_set():
-                return False
+                raise _Stopped()
             if self._skip_target is not None and self._skip_target == skip_idx:
                 raise _SkipCurrent()
             if self._pause_evt.is_set():
@@ -1072,13 +1136,21 @@ class TransferEngine:
         return True
 
     # ------------------------------------------------------------------
+<<<<<<< HEAD
     async def _transfer(self, cfg, msgs: list, reply_map: dict) -> None:
+=======
+    async def _transfer(self, cfg, msgs: list, reply_map: dict, progress_cb=None, state_builder=None) -> None:
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
         if cfg.mode == "forward":
             await self._forward(cfg, msgs, reply_map)
         elif cfg.mode == "copy":
             await self._copy(cfg, msgs, reply_map)
         elif cfg.mode == "download":
+<<<<<<< HEAD
             await self._download_transfer(cfg, msgs, reply_map)
+=======
+            await self._download_transfer(cfg, msgs, reply_map, progress_cb, state_builder)
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
 
     async def _forward(self, cfg, msgs: list, reply_map: dict) -> None:
         ids = [m.id for m in msgs]
@@ -1226,7 +1298,11 @@ class TransferEngine:
             return sent.id
         return None
 
+<<<<<<< HEAD
     async def _download_transfer(self, cfg, msgs: list, reply_map: dict) -> None:
+=======
+    async def _download_transfer(self, cfg, msgs: list, reply_map: dict, progress_cb=None, state_builder=None) -> None:
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
         """Strictly sequential download & re-upload of a single item.
 
         Lifecycle per file: download -> verify -> upload -> delete, one file
@@ -1285,7 +1361,11 @@ class TransferEngine:
                         if path:
                             pairs.append((m, path))
                     if pairs:
+<<<<<<< HEAD
                         if not await self._pause_gate(None, None):
+=======
+                        if not await self._pause_gate(progress_cb, state_builder):
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                             raise _Abort()
                         log.info(
                             "uploading album of %d file(s) to %s",
@@ -1315,7 +1395,11 @@ class TransferEngine:
                                 reply_map[m.id] = sent.id
                 else:
                     for m in media_msgs:
+<<<<<<< HEAD
                         if not await self._pause_gate(None, None):
+=======
+                        if not await self._pause_gate(progress_cb, state_builder):
+>>>>>>> 7431589 (fix: production-grade reliability hardening for 24/7 operation)
                             raise _Abort()
                         self._file_dl = None
                         self._file_up = None
@@ -1409,6 +1493,10 @@ def _mime_to_ext(mime: str) -> str:
 
 class _Abort(Exception):
     """Internal: stop the current run because auto_resume is off / user stopped."""
+
+
+class _Stopped(Exception):
+    """Internal: stop was requested mid-operation."""
 
 
 class _SkipCurrent(Exception):

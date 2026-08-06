@@ -96,6 +96,8 @@ class Config:
     # Reconnect loop for the bot client.
     RECONNECT_DELAY: float = float(os.getenv("RECONNECT_DELAY", "5"))
 
+    FORCE_BOT_AUTO_APPROVE: bool = os.getenv("FORCE_BOT_AUTO_APPROVE", "false").lower() in ("1", "true", "yes")
+
     # Bot health watchdog: ping interval and per-ping timeout.
     BOT_WATCHDOG_INTERVAL: float = float(os.getenv("BOT_WATCHDOG_INTERVAL", "30"))
     BOT_PING_TIMEOUT: float = float(os.getenv("BOT_PING_TIMEOUT", "10"))

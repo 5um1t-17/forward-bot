@@ -502,7 +502,34 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
             except (MessageNotModifiedError, MessageIdInvalidError, asyncio.TimeoutError):
                 pass
             except Exception:
-                log.debug("progress edit failed", exc_info=True)
+                log.warning("progress edit failed for uid=%s msg=%s", uid, current.get("progress_msg_id"), exc_info=True)
+
+    async def render(force: bool = False) -> None:
+        """Awaitable bounded edit; used by the button handlers and updater."""
+        await _do_edit(force=force)
+
+    async def schedule_render(force: bool = False) -> None:
+        """Fire-and-forget bounded edit, coalesced to one pending task.
+
+        The engine's ``progress_cb`` uses this so a slow bot edit can never
+        block the transfer loop (the root cause of the freeze-on-Render bug).
+        """
+        current = store.progress.get(uid)
+        if current is None or not current.get("running"):
+            return
+        if current.get("render_pending"):
+            return
+        current["render_pending"] = True
+
+        async def _bounded() -> None:
+            try:
+                await _do_edit(force=force)
+            finally:
+                cur = store.progress.get(uid)
+                if cur is not None:
+                    cur["render_pending"] = False
+
+        asyncio.create_task(_bounded())
 
     async def render(force: bool = False) -> None:
         """Awaitable bounded edit; used by the button handlers and updater."""
@@ -656,7 +683,17 @@ async def _pause(bot, event, uid: int) -> bool:
         try:
             await snap["render"](force=True)
         except Exception:
-            pass
+            log.warning("pause render failed for uid=%s", uid, exc_info=True)
+            try:
+                await bot.edit_message(
+                    uid,
+                    snap["progress_msg_id"],
+                    text.progress_text(snap),
+                    buttons=keyboards.running_keyboard(True),
+                    parse_mode="html",
+                )
+            except Exception:
+                log.warning("pause fallback edit failed for uid=%s", uid, exc_info=True)
     await answer(event, "⏸ Paused — press Resume to continue")
     return True
 
@@ -673,7 +710,17 @@ async def _resume(bot, event, uid: int) -> bool:
         try:
             await snap["render"](force=True)
         except Exception:
-            pass
+            log.warning("resume render failed for uid=%s", uid, exc_info=True)
+            try:
+                await bot.edit_message(
+                    uid,
+                    snap["progress_msg_id"],
+                    text.progress_text(snap),
+                    buttons=keyboards.running_keyboard(False),
+                    parse_mode="html",
+                )
+            except Exception:
+                log.warning("resume fallback edit failed for uid=%s", uid, exc_info=True)
     await answer(event, "▶ Resumed")
     return True
 
@@ -822,9 +869,19 @@ async def _on_source_input(bot, event, uid: int) -> bool:
     try:
         client = await client_pool.get(uid, sid)
         if event.message.forward:
-            resolved = await resolve_forwarded(client, event.message)
+            resolved = await asyncio.wait_for(
+                resolve_forwarded(client, event.message),
+                timeout=config.OP_TIMEOUT,
+            )
         else:
-            resolved = await resolve(client, event.raw_text)
+            resolved = await asyncio.wait_for(
+                resolve(client, event.raw_text),
+                timeout=config.OP_TIMEOUT,
+            )
+    except asyncio.TimeoutError:
+        log.warning("source resolve timed out for user %s", uid)
+        await event.respond("⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.")
+        return True
     except ValueError as exc:
         log.warning("source resolve error: %s", exc)
         await event.respond("⚠️ Session issue: please go to 👤 Accounts → 🗑 Delete Account, then ➕ Add Account again.")
@@ -847,7 +904,14 @@ async def _on_dest_input(bot, event, uid: int) -> bool:
     sid = await db.get_active_sid(uid)
     try:
         client = await client_pool.get(uid, sid)
-        resolved = await resolve(client, event.raw_text)
+        resolved = await asyncio.wait_for(
+            resolve(client, event.raw_text),
+            timeout=config.OP_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning("dest resolve timed out for user %s", uid)
+        await event.respond("⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.")
+        return True
     except Exception as exc:
         log.warning("dest resolve error: %s", exc)
         await event.respond(f"⚠️ Resolution failed: <code>{str(exc)[:200]}</code>")
@@ -900,19 +964,31 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
             return True
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
-                entity = await _resolve_private_channel(client, parsed["cid"])
+                entity = await asyncio.wait_for(
+                    _resolve_private_channel(client, parsed["cid"]),
+                    timeout=config.OP_TIMEOUT,
+                )
                 if entity is None:
                     await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
                     return True
             else:
                 identifier = parsed.get("identifier") or parsed.get("slug")
-                entity = await client.get_entity(identifier)
+                entity = await asyncio.wait_for(
+                    client.get_entity(identifier),
+                    timeout=config.OP_TIMEOUT,
+                )
             msg_id = parsed.get("msg_id")
         elif parsed["kind"] == "username":
-            entity = await client.get_entity(parsed["username"])
+            entity = await asyncio.wait_for(
+                client.get_entity(parsed["username"]),
+                timeout=config.OP_TIMEOUT,
+            )
             msg_id = None
         elif parsed["kind"] == "channel_id":
-            entity = await client.get_entity(parsed["id"])
+            entity = await asyncio.wait_for(
+                client.get_entity(parsed["id"]),
+                timeout=config.OP_TIMEOUT,
+            )
             msg_id = None
         else:
             await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123, https://t.me/joinchat/abc123/123, or https://t.me/c/123456789/123")
@@ -926,6 +1002,13 @@ async def _on_link_start_input(bot, event, uid: int) -> bool:
         await event.respond(
             f"✅ <b>Start message set</b> — <code>{msg_id}</code>\n\n"
             f"Now send the <b>end message link</b> from the same chat.",
+            parse_mode="html",
+        )
+        return True
+    except asyncio.TimeoutError:
+        log.warning("link start resolve timed out for user %s", uid)
+        await event.respond(
+            "⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.",
             parse_mode="html",
         )
         return True
@@ -953,14 +1036,20 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
             return True
         if parsed["kind"] == "message_link":
             if parsed.get("slug") == "c":
-                end_entity = await _resolve_private_channel(client, parsed["cid"])
+                end_entity = await asyncio.wait_for(
+                    _resolve_private_channel(client, parsed["cid"]),
+                    timeout=config.OP_TIMEOUT,
+                )
                 if end_entity is None:
                     await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
                     return True
                 end_chat_id = end_entity.id
             else:
                 end_identifier = parsed.get("identifier") or parsed.get("slug")
-                end_entity = await client.get_entity(end_identifier)
+                end_entity = await asyncio.wait_for(
+                    client.get_entity(end_identifier),
+                    timeout=config.OP_TIMEOUT,
+                )
                 end_chat_id = end_entity.id
             end_msg_id = parsed.get("msg_id")
         else:
@@ -982,6 +1071,13 @@ async def _on_link_end_input(bot, event, uid: int) -> bool:
             parse_mode="html",
         )
         await event.respond(text.mode_prompt(), buttons=keyboards.mode_keyboard(), parse_mode="html")
+        return True
+    except asyncio.TimeoutError:
+        log.warning("link end resolve timed out for user %s", uid)
+        await event.respond(
+            "⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.",
+            parse_mode="html",
+        )
         return True
     except Exception as exc:
         log.warning("end link resolve error: %s", exc)

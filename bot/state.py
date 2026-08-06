@@ -66,5 +66,12 @@ class Store:
     def pending(self, user_id: int) -> str | None:
         return self.pending_input.get(user_id)
 
+    def cancel_all_running(self) -> None:
+        for uid, engine in list(self.running.items()):
+            try:
+                engine.request_stop()
+            except Exception:
+                pass
+
 
 store = Store()

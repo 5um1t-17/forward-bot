@@ -272,6 +272,7 @@ async def main() -> None:
             raise
         except Exception:
             log.exception("bot loop crashed; restarting")
+        store.cancel_all_running()
         log.warning("Bot disconnected; reconnecting in %.0fs", backoff)
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60)
