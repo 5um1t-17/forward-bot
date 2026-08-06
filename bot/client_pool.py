@@ -45,26 +45,25 @@ class ClientPool:
             self._locks[key] = lock
         return lock
 
-    async def get(self, user_id: int, sid: str):
+    async def get(self, user_id: int, sid: str, timeout: float | None = None):
         key = (user_id, sid)
         client = self._clients.get(key)
         if client is not None and client.is_connected():
             return client
-        # Only one client may ever exist per account: the per-key lock plus the
-        # double-check guarantees concurrent callbacks never spin up a second
-        # session (and a second hung connection) for the same account.
         async with self._lock(key):
             client = self._clients.get(key)
             if client is not None and client.is_connected():
                 return client
             if client is not None:
-                # pooled client dropped its connection — rebuild it fresh
                 self._clients.pop(key, None)
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
                 except Exception:
                     pass
-            session_string = await session_manager.decrypt_session(user_id, sid)
+            session_string = await asyncio.wait_for(
+                session_manager.decrypt_session(user_id, sid),
+                timeout=timeout or config.CLIENT_CONNECT_TIMEOUT,
+            )
             if session_string is None:
                 raise ValueError("Session not found or failed to decrypt")
             client = session_manager.build_client(session_string)
@@ -72,7 +71,7 @@ class ClientPool:
                 await asyncio.wait_for(client.connect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
             except asyncio.TimeoutError:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
                 except Exception:
                     pass
                 raise ValueError("Telegram connection timed out — try again in a moment")
@@ -82,18 +81,18 @@ class ClientPool:
                 )
             except asyncio.TimeoutError:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
                 except Exception:
                     pass
                 raise ValueError("Telegram connection timed out — try again in a moment")
             if not authorized:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=config.CLIENT_CONNECT_TIMEOUT)
                 except Exception:
                     pass
                 raise ValueError("Session is no longer authorized — please re-add the account")
             self._clients[key] = client
-            await db.touch_session(sid)
+            await asyncio.wait_for(db.touch_session(sid), timeout=config.CLIENT_CONNECT_TIMEOUT)
             return client
 
     async def refresh(self, user_id: int, sid: str):

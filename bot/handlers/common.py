@@ -22,9 +22,14 @@ async def answer(event: events.CallbackQuery.Event, text: str | None = None, ale
         log.debug("answer failed", exc_info=True)
 
 
-async def edit(event: events.CallbackQuery.Event, text: str, kb=None) -> None:
+async def edit(event: events.CallbackQuery.Event, text: str, kb=None, *, timeout: float = 20.0) -> None:
     try:
-        await event.edit(text, buttons=kb, parse_mode="html")
+        await asyncio.wait_for(
+            event.edit(text, buttons=kb, parse_mode="html"),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        log.debug("edit timed out for uid=%s", getattr(event, "sender_id", None))
     except MessageNotModifiedError:
         pass
     except Exception:

@@ -165,7 +165,9 @@ async def _next_to_dest(bot, event, uid: int) -> bool:
 
 
 async def _fetch_dest_dialogs(uid: int) -> list[dict]:
-    sid = await db.get_active_sid(uid)
+    sid = await asyncio.wait_for(db.get_active_sid(uid), timeout=10.0)
+    if not sid:
+        return []
     client = await client_pool.get(uid, sid)
     return await fetch_sendable_dialogs(client, limit=100)
 
@@ -174,25 +176,34 @@ async def _ask_dest(bot, event, uid: int) -> bool:
     wiz = store.get_transfer(uid)
     store.set_pending(uid, None)
     wiz.dest_page = 0
+    try:
+        await asyncio.wait_for(
+            _do_ask_dest(bot, event, uid, wiz),
+            timeout=config.FETCH_DIALOGS_TIMEOUT + 15,
+        )
+    except asyncio.TimeoutError:
+        log.warning("_ask_dest overall timed out for user %s", uid)
+    except Exception as exc:
+        log.warning("_ask_dest failed: %s", exc)
+    return True
+
+
+async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
     await edit(event, "⏳ Loading destination chats...", None)
     try:
-        wiz.dialogs = await asyncio.wait_for(
-            _fetch_dest_dialogs(uid),
-            timeout=config.FETCH_DIALOGS_TIMEOUT + 5,
-        )
+        wiz.dialogs = await _fetch_dest_dialogs(uid)
     except asyncio.TimeoutError:
         log.warning("destination dialog fetch timed out for user %s", uid)
         await edit(event, text.dest_timeout_prompt(), keyboards.dest_manual_keyboard())
-        return True
+        return
     except Exception as exc:
         log.warning("dialogs failed: %s", exc)
         await edit(event, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
-        return True
+        return
     if not wiz.dialogs:
         await edit(event, "⚠️ No groups/channels found where you can post.", keyboards.dest_manual_keyboard())
-        return True
+        return
     await edit(event, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
-    return True
 
 
 async def _ask_count(bot, event, uid: int) -> bool:
