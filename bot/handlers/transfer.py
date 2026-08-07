@@ -579,7 +579,12 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
         hundreds of edit calls a minute and triggers a long FloodWaitError that
         blocks *all* bot messages (including the destination chat list).
         """
-        from bot.handlers.common import flood_blocked, flood_remaining, note_flood
+        from bot.handlers.common import (
+            flood_blocked,
+            flood_remaining,
+            note_bot_activity,
+            note_flood,
+        )
 
         current = store.progress.get(uid)
         if current is None or not current.get("running"):
@@ -603,11 +608,16 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
                     ),
                     timeout=config.EDIT_TIMEOUT,
                 )
-            except (MessageNotModifiedError, MessageIdInvalidError, asyncio.TimeoutError):
-                pass
+                note_bot_activity()
+            except (MessageNotModifiedError, MessageIdInvalidError, asyncio.TimeoutError) as exc:
+                # MessageNotModifiedError / MessageIdInvalidError mean Telegram
+                # answered (link is alive); only the timeout is inconclusive.
+                if not isinstance(exc, asyncio.TimeoutError):
+                    note_bot_activity()
             except FloodWaitError as exc:
                 log.warning("progress edit flood wait: %ss", exc.seconds)
                 await note_flood(exc.seconds)
+                note_bot_activity()  # the link responded, even if rate-limited
             except Exception:
                 log.warning("progress edit failed for uid=%s msg=%s", uid, current.get("progress_msg_id"), exc_info=True)
 
@@ -690,12 +700,13 @@ async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
                 log.warning("client refresh failed for user %s: %s", uid, exc)
                 return None
 
-        result = await engine_obj.run(
-            client=client,
-            cfg=cfg,
-            progress_cb=progress_cb,
-            refresh_client=refresh_client,
-        )
+        async with client_pool.use(uid, cfg.sid):
+            result = await engine_obj.run(
+                client=client,
+                cfg=cfg,
+                progress_cb=progress_cb,
+                refresh_client=refresh_client,
+            )
     finally:
         store.running.pop(uid, None)
         update_task.cancel()

@@ -132,7 +132,8 @@ class Scheduler:
                     log.warning("client refresh failed for user %s: %s", user_id, exc)
                     return None
 
-            result = await engine.run(client, cfg, refresh_client=refresh_client)
+            async with client_pool.use(user_id, sid):
+                result = await engine.run(client, cfg, refresh_client=refresh_client)
             await db.update_log(
                 log_id,
                 {

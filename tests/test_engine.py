@@ -674,6 +674,99 @@ async def test_stall_watchdog_catches_no_first_progress():
         bconfig.config.STALL_TIMEOUT = old_stall
 
 
+def test_progress_slot_orphan_cannot_clobber():
+    # A late callback from a cancelled/orphaned op must never replace the
+    # current op's snapshot nor refresh the run watchdog anchor (which would
+    # mask a genuine stall).
+    eng = TransferEngine()
+    cb1, slot1 = eng._file_progress_cb("a.txt", "Downloading", "dl")
+    eng._file_dl = slot1
+    cb1(100, 1000)  # current op publishes normally
+    assert eng._file_dl is slot1 and slot1["done"] == 100
+    anchor = eng._last_activity_ts
+
+    cb2, slot2 = eng._file_progress_cb("b.txt", "Downloading", "dl")
+    eng._file_dl = slot2  # the next op replaces the slot
+    cb1(500, 1000)  # orphan callback fires late
+    assert eng._file_dl is slot2, "orphan must not replace the current slot"
+    assert slot2["done"] == 0, "orphan must not write into the current slot"
+    assert eng._last_activity_ts == anchor, "orphan must not refresh the watchdog anchor"
+
+    cb2(10, 1000)
+    assert slot2["done"] == 10
+    assert eng._file_dl is slot2
+    print("progress slot orphan isolation OK")
+
+
+async def test_guard_stubborn_task_raises_control_exception():
+    import bot.transfer_engine as te
+
+    old_wait = te._CANCEL_WAIT
+    te._CANCEL_WAIT = 0.05
+    try:
+        eng = TransferEngine()
+
+        async def stubborn():
+            # Swallows the first CancelledError and keeps running, simulating a
+            # Telethon op wedged in a long synchronous write that ignores
+            # cancellation for longer than _CANCEL_WAIT.
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.1)
+
+        async def stopper():
+            await asyncio.sleep(0.05)
+            eng.request_stop()
+
+        stopper_task = asyncio.create_task(stopper())
+        try:
+            start = time.monotonic()
+            try:
+                await eng._guard(stubborn(), opname="stubborn")
+                raise AssertionError("expected _Stopped")
+            except te._Stopped:
+                pass
+            elapsed = time.monotonic() - start
+            assert elapsed < 2.0, f"_guard cleanup must not hang (took {elapsed:.1f}s)"
+        finally:
+            stopper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stopper_task
+            # nothing may leak into the next run
+            assert not eng._op_tasks, eng._op_tasks
+    finally:
+        te._CANCEL_WAIT = old_wait
+    print("guard stubborn-task control exception OK")
+
+
+async def test_dedup_and_mark_db_failure_do_not_abort_run():
+    from bot.transfer_engine import db as engine_db
+
+    src, dst = FakeEntity(1), FakeEntity(2)
+    msgs = [FakeMessage(10, text="hi")]
+    client = FakeClient(msgs)
+    eng = TransferEngine()
+    cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[10],
+                         mode="forward", dedup=True, sid="abc")
+
+    async def boom(*args, **kwargs):
+        raise asyncio.TimeoutError("mongo unavailable")
+
+    old_is = engine_db.is_transferred
+    old_mark = engine_db.mark_transferred
+    engine_db.is_transferred = boom
+    engine_db.mark_transferred = boom
+    try:
+        result = await eng.run(client, cfg)
+    finally:
+        engine_db.is_transferred = old_is
+        engine_db.mark_transferred = old_mark
+
+    assert result.success == 1 and result.failed == 0 and not result.cancelled, result
+    print("dedup/mark DB failure tolerance OK")
+
+
 async def main():
     test_parse_input()
     test_filter()
@@ -696,6 +789,9 @@ async def main():
     await test_watchdog_fires_on_real_stall()
     await test_watchdog_ignores_paused_run()
     await test_stall_watchdog_catches_no_first_progress()
+    test_progress_slot_orphan_cannot_clobber()
+    await test_guard_stubborn_task_raises_control_exception()
+    await test_dedup_and_mark_db_failure_do_not_abort_run()
     print("ALL TESTS PASSED")
 
 

@@ -114,7 +114,13 @@ class Config:
 
     # Bot health watchdog: ping interval and per-ping timeout.
     BOT_WATCHDOG_INTERVAL: float = float(os.getenv("BOT_WATCHDOG_INTERVAL", "30"))
-    BOT_PING_TIMEOUT: float = float(os.getenv("BOT_PING_TIMEOUT", "10"))
+    BOT_PING_TIMEOUT: float = float(os.getenv("BOT_PING_TIMEOUT", "15"))
+    # While the bot has answered a real RPC (progress edit, callback answer,
+    # message send) within this many seconds, it is demonstrably alive, so the
+    # watchdog skips the ping entirely. Under transfer load the ping RPC can
+    # time out even though the link is healthy; without this skip the watchdog
+    # would force a reconnect and cancel every running transfer.
+    BOT_ACTIVITY_SKIP: float = float(os.getenv("BOT_ACTIVITY_SKIP", "90"))
 
     # How often the client pool sweeps dead clients.
     POOL_SWEEP_INTERVAL: float = float(os.getenv("POOL_SWEEP_INTERVAL", "60"))

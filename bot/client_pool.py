@@ -6,6 +6,7 @@ of the process, so transfers start instantly after the first use.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from telethon.tl.functions.account import UpdateStatusRequest
@@ -37,6 +38,10 @@ class ClientPool:
         # one lock per account so concurrent callbacks never spin up a second
         # client (and a second hung connection) while the first is connecting
         self._locks: dict[tuple[int, str], asyncio.Lock] = {}
+        # refcount of active runs per account key. ``sweep`` skips clients that
+        # are currently driving a transfer, so a healthy-but-busy client is
+        # never disconnected just because its ping happened to be slow.
+        self._in_use: dict[tuple[int, str], int] = {}
 
     def _lock(self, key: tuple[int, str]) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -44,6 +49,27 @@ class ClientPool:
             lock = asyncio.Lock()
             self._locks[key] = lock
         return lock
+
+    @contextlib.asynccontextmanager
+    async def use(self, user_id: int, sid: str):
+        """Mark an account's client as in use for the duration of a run.
+
+        Wrap ``engine.run(...)`` with this so the periodic pool sweep does not
+        disconnect a client that is actively transferring.
+        """
+        key = (user_id, sid)
+        self._in_use[key] = self._in_use.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._in_use.get(key, 0) - 1
+            if remaining <= 0:
+                self._in_use.pop(key, None)
+            else:
+                self._in_use[key] = remaining
+
+    def in_use(self, key: tuple[int, str]) -> bool:
+        return self._in_use.get(key, 0) > 0
 
     async def _is_usable(self, client, timeout: float = 4.0) -> bool:
         """True if ``client`` answers a lightweight RPC.
@@ -146,6 +172,10 @@ class ClientPool:
         """
         removed = 0
         for key in list(self._clients):
+            if self.in_use(key):
+                # Actively driving a transfer: a slow ping is expected and is
+                # not a reason to disconnect a healthy-but-busy client.
+                continue
             client = self._clients.get(key)
             if client is None:
                 continue

@@ -36,7 +36,6 @@ Strategy
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import tempfile
@@ -62,6 +61,13 @@ log = logging.getLogger("bot.engine")
 # How often the engine pushes a live snapshot while a transfer is in flight
 # (the handler throttles actual message edits to PROGRESS_REFRESH).
 _HEARTBEAT_INTERVAL = 0.5
+
+# How long _guard waits for a cancelled operation to actually die before
+# giving up. A stuck Telethon op (e.g. inside a long synchronous write) can
+# ignore cancellation for longer than this; we never wait forever, we never let
+# this wait mask the control exception the caller wants to raise, and the
+# orphaned task is logged so it can be tracked down.
+_CANCEL_WAIT = 5.0
 
 # Exceptions that indicate the underlying MTProto connection is likely dead.
 # When one of these is raised repeatedly, the engine asks the caller to rebuild
@@ -257,6 +263,10 @@ class TransferEngine:
         # a previous job can never leak into the next one, and it is always a
         # value from the same time.monotonic() clock — never 0.0.
         self._last_activity_ts: float = 0.0
+        # Every in-flight operation task created by _guard. run()'s finally
+        # cancels any stragglers so a stuck operation can never leak into the
+        # next run (or accumulate across a long-lived process).
+        self._op_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # control
@@ -396,8 +406,23 @@ class TransferEngine:
         """Build a Telethon progress_callback that feeds the live snapshot.
 
         ``which`` selects the slot: "dl" for downloads, "up" for uploads.
+
+        Returns ``(callback, slot_dict)``. The caller publishes the slot by
+        assigning it to ``self._file_dl`` / ``self._file_up`` before starting
+        the operation. The callback updates the slot in place and only
+        publishes it (and refreshes the run watchdog anchor) while that exact
+        slot object is still the current one — a late callback from a
+        cancelled-but-alive operation can therefore never clobber the snapshot
+        of the operation that replaced it.
         """
-        slot = "_file_dl" if which == "dl" else "_file_up"
+        attr = "_file_dl" if which == "dl" else "_file_up"
+        slot: dict = {
+            "filename": filename or "file",
+            "done": 0,
+            "total": 0,
+            "speed": 0.0,
+            "eta": 0.0,
+        }
         st = {"ts": 0.0, "prev": 0.0}
 
         def cb(received: int, total: int) -> None:
@@ -412,20 +437,22 @@ class TransferEngine:
                 st["ts"] = now
                 st["prev"] = received
             total = total or 0
-            setattr(self, slot, {
+            slot.update({
                 "filename": filename or "file",
                 "done": received,
                 "total": total,
                 "speed": speed,
                 "eta": (total - received) / speed if speed > 0 and total else 0.0,
             })
+            # A late callback from a cancelled/orphaned operation must never
+            # clobber the current operation's snapshot, nor keep the run
+            # watchdog satisfied on behalf of a hung operation.
+            if getattr(self, attr, None) is not slot:
+                return
             self._operation = operation
-            # Real byte progress means the pipeline is alive: refresh the
-            # run-level watchdog anchor so a slow-but-progressing transfer is
-            # never mistaken for a stall.
             self._last_activity_ts = time.monotonic()
 
-        return cb
+        return cb, slot
 
     # ------------------------------------------------------------------
     async def run(
@@ -570,6 +597,12 @@ class TransferEngine:
                         await task
                     except (asyncio.CancelledError, Exception):
                         pass
+            # Cancel any op task that survived a _guard cancellation (a stuck
+            # Telethon operation that ignored cancellation). Nothing may leak
+            # across runs or accumulate on a long-lived process.
+            for t in list(self._op_tasks):
+                if not t.done():
+                    await self._cancel_op_task(t, "run finalizer")
 
         result.duration = time.monotonic() - start
         log.info(
@@ -774,6 +807,25 @@ class TransferEngine:
         return True
 
     # ------------------------------------------------------------------
+    async def _cancel_op_task(self, task: asyncio.Task, opname: str) -> None:
+        """Cancel an in-flight op task and wait briefly for it to die.
+
+        A stuck Telethon operation may not honour cancellation immediately
+        (e.g. it is inside a long synchronous write). We never wait longer than
+        ``_CANCEL_WAIT`` and we never let this cleanup's own timeout mask the
+        exception the caller wants to raise — both ``CancelledError`` (the task
+        honoured cancellation) and ``TimeoutError`` (it did not) are swallowed
+        here. A task that survives is logged and left for ``run()``'s final
+        cleanup, which tracks every op task it created.
+        """
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=_CANCEL_WAIT)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        if not task.done():
+            log.warning("op %s ignored cancellation and is still running; orphaned", opname)
+
     async def _guard(
         self,
         coro,
@@ -794,16 +846,30 @@ class TransferEngine:
 
         Nothing can hang forever: every path either returns the result, raises
         the underlying error, raises ``TimeoutError`` (retried upstream) or
-        raises ``_Paused``.
+        raises ``_Paused``. Every task is tracked in ``self._op_tasks`` and
+        removed when it completes; a task that ignores cancellation is logged
+        (never silently leaked) and cleaned up by ``run()``'s ``finally``.
         """
         if self._pause_evt.is_set():
             raise _Paused()
         task = asyncio.create_task(coro)
+        self._op_tasks.add(task)
+        task.add_done_callback(self._op_tasks.discard)
         op_start = time.monotonic()
         last_ts = time.monotonic()
         last_prog = progress() if progress is not None else None
         seen_progress = progress is not None and last_prog is not None
         deadline = (time.monotonic() + timeout) if timeout else None
+        cleaned = False
+
+        async def _cleanup() -> None:
+            # Guarantee at most one cancellation attempt per op, so a task that
+            # ignores cancellation costs one _CANCEL_WAIT at most.
+            nonlocal cleaned
+            if not cleaned:
+                cleaned = True
+                await self._cancel_op_task(task, opname)
+
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=config.CONTROL_POLL)
@@ -814,15 +880,11 @@ class TransferEngine:
                 now = time.monotonic()
                 if self._stop.is_set():
                     log.info("Stop detected in %s, cancelling", opname)
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.wait_for(task, timeout=5.0)
+                    await _cleanup()
                     raise _Stopped()
                 if self._pause_evt.is_set():
                     log.info("Pause interrupted %s, cancelling", opname)
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.wait_for(task, timeout=5.0)
+                    await _cleanup()
                     raise _Paused()
                 if progress is not None:
                     cur = progress()
@@ -843,23 +905,17 @@ class TransferEngine:
                                 "Watchdog: %s stalled (%ss with no progress), cancelling",
                                 opname, stall_timeout,
                             )
-                            task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await asyncio.wait_for(task, timeout=5.0)
+                            await _cleanup()
                             raise asyncio.TimeoutError(
                                 f"{opname} stalled ({stall_timeout:.0f}s no progress)"
                             )
                 if deadline is not None and now >= deadline:
                     log.warning("Watchdog: %s timed out after %ss", opname, timeout)
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.wait_for(task, timeout=5.0)
+                    await _cleanup()
                     raise asyncio.TimeoutError(f"{opname} timed out after {timeout:.0f}s")
         finally:
             if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.wait_for(task, timeout=5.0)
+                await _cleanup()
 
     def _dl_progress(self) -> int | None:
         return (self._file_dl or {}).get("done")
@@ -879,19 +935,11 @@ class TransferEngine:
         ext = _media_extension(msg)
         tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
         temp_paths.add(tmp_path)
-        # Seed the download snapshot so the _guard stall watchdog is armed from
-        # the very first poll (done=0, not None). Without this a download whose
-        # first progress report never arrives (e.g. the parallel part-path
-        # wedging on its first request) would report no progress, keep
-        # seen_progress=False and hang forever.
-        self._file_dl = {
-            "filename": _msg_filename(msg) or f"message_{msg.id}",
-            "done": 0,
-            "total": 0,
-            "speed": 0.0,
-            "eta": 0.0,
-        }
-        progress = self._file_progress_cb(
+        # Create the per-op progress slot and publish it as the current
+        # download snapshot. The slot object (not a value copy) is what the
+        # progress callback checks against, so a late callback from a
+        # cancelled/orphaned download can never clobber this one.
+        progress, self._file_dl = self._file_progress_cb(
             _msg_filename(msg) or f"message_{msg.id}", "Downloading", "dl"
         )
         log.info("Download started: msg=%d -> %s", msg.id, tmp_path)
@@ -979,8 +1027,15 @@ class TransferEngine:
         part_size = 512 * 1024
         total_parts = max(1, (file_size + part_size - 1) // part_size)
         n = max(1, min(parts, total_parts, 8))
-        with open(dest_path, "wb") as f:
-            f.truncate(file_size)
+
+        # Extending a multi-GB file can block for a while on some filesystems;
+        # never run it on the event loop (it would starve the bot's health
+        # pings and look like a freeze).
+        def _preallocate() -> None:
+            with open(dest_path, "wb") as f:
+                f.truncate(file_size)
+
+        await asyncio.to_thread(_preallocate)
 
         state = {"done": 0}
 
@@ -1058,7 +1113,7 @@ class TransferEngine:
 
         if cfg.dedup:
             for m in msgs:
-                if await db.is_transferred(src_id, dst_id, m.id):
+                if await self._dedup_checked(src_id, dst_id, m.id):
                     result.skipped += len(msgs)
                     return
 
@@ -1070,9 +1125,39 @@ class TransferEngine:
         sent_count = 0
         for m in msgs:
             if m.id in reply_map:
-                await db.mark_transferred(src_id, dst_id, m.id, cfg.sid, cfg.mode)
+                await self._mark_sent(src_id, dst_id, m.id, cfg.sid, cfg.mode)
                 sent_count += 1
         result.success += sent_count
+
+    async def _dedup_checked(self, src_id: int, dst_id: int, msg_id: int) -> bool:
+        """Dedup lookup, bounded by ``MSG_FETCH_TIMEOUT``.
+
+        The worker loop must never block on MongoDB: if the store is slow or
+        unreachable the check is treated as "not transferred" (proceed) instead
+        of stalling the run or aborting it.
+        """
+        try:
+            return await asyncio.wait_for(
+                db.is_transferred(src_id, dst_id, msg_id),
+                timeout=config.MSG_FETCH_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("dedup check failed for msg=%s (%s); proceeding", msg_id, exc)
+            return False
+
+    async def _mark_sent(self, src_id: int, dst_id: int, msg_id: int, sid: str, mode: str) -> None:
+        """Record a transferred message, bounded by ``MSG_FETCH_TIMEOUT``.
+
+        The message was already sent; a dedup-record failure must never abort
+        the run, so the error is logged and swallowed.
+        """
+        try:
+            await asyncio.wait_for(
+                db.mark_transferred(src_id, dst_id, msg_id, sid, mode),
+                timeout=config.MSG_FETCH_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mark_transferred failed for msg=%s (%s); continuing", msg_id, exc)
 
     async def _with_retries(
         self, cfg, fn, skip_idx: int | None = None,
@@ -1274,9 +1359,11 @@ class TransferEngine:
                 if did is not None:
                     reply_map[m.id] = did
             return
+        up_cb, self._file_up = self._file_progress_cb("album", "Uploading", "up")
         sent = await self._guard(
             self._client.send_file(
-                cfg.dest_entity, media, caption=caption, silent=cfg.silent
+                cfg.dest_entity, media, caption=caption, silent=cfg.silent,
+                progress_callback=up_cb,
             ),
             timeout=config.OP_TIMEOUT,
             progress=self._up_progress,
@@ -1330,6 +1417,9 @@ class TransferEngine:
         media = msg.media
         is_webpage = isinstance(media, types.MessageMediaWebPage)
         if media and not is_webpage:
+            up_cb, self._file_up = self._file_progress_cb(
+                _msg_filename(msg) or f"message_{msg.id}", "Uploading", "up"
+            )
             sent = await self._guard(
                 self._client.send_file(
                     cfg.dest_entity,
@@ -1339,6 +1429,7 @@ class TransferEngine:
                     parse_mode=None,
                     reply_to=reply_to,
                     silent=cfg.silent,
+                    progress_callback=up_cb,
                 ),
                 timeout=config.OP_TIMEOUT,
                 progress=self._up_progress,
@@ -1430,16 +1521,9 @@ class TransferEngine:
                             "uploading album of %d file(s) to %s",
                             len(pairs), cfg.dest_name or cfg.dest_entity.id,
                         )
-                        up_cb = self._file_progress_cb(
+                        up_cb, self._file_up = self._file_progress_cb(
                             _msg_filename(pairs[0][0]) or "album", "Uploading", "up"
                         )
-                        self._file_up = {
-                            "filename": _msg_filename(pairs[0][0]) or "album",
-                            "done": 0,
-                            "total": 0,
-                            "speed": 0.0,
-                            "eta": 0.0,
-                        }
                         log.debug("pipeline: album upload await (%d files)", len(pairs))
                         sent = await self._guard(
                             self._client.send_file(
@@ -1471,18 +1555,9 @@ class TransferEngine:
                         log.debug("pipeline: download returned msg=%d path=%s", m.id, path)
                         if not path:
                             continue
-                        up_cb = self._file_progress_cb(
+                        up_cb, self._file_up = self._file_progress_cb(
                             _msg_filename(m) or f"message_{m.id}", "Uploading", "up"
                         )
-                        # Seed the upload snapshot so the _guard stall watchdog is
-                        # armed from the first poll (done=0), never None.
-                        self._file_up = {
-                            "filename": _msg_filename(m) or f"message_{m.id}",
-                            "done": 0,
-                            "total": 0,
-                            "speed": 0.0,
-                            "eta": 0.0,
-                        }
                         log.debug("pipeline: upload await msg=%d", m.id)
                         sent = await self._guard(
                             self._client.send_file(

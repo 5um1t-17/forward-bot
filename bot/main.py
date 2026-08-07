@@ -212,9 +212,11 @@ async def _bot_alive(bot: TelegramClient, timeout: float | None = None) -> bool:
         return True
     except asyncio.CancelledError:
         raise
-    except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError):
+    except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError) as exc:
+        log.warning("bot health ping failed: %s: %s", type(exc).__name__, exc)
         return False
-    except Exception:  # noqa: BLE001 - any other error means the link is dead
+    except Exception as exc:  # noqa: BLE001 - any other error means the link is dead
+        log.warning("bot health ping failed: %s: %s", type(exc).__name__, exc)
         return False
 
 
@@ -237,13 +239,24 @@ async def _bot_health_watchdog(bot: TelegramClient) -> None:
     * While the bot account is flood-limited, pings fail spuriously even though
       the link is perfectly alive, so those intervals are skipped entirely —
       otherwise a transfer's progress edits would trigger a disconnect cascade.
+    * While the bot has answered any real RPC recently (progress edits happen
+      every few seconds during a transfer), the ping is skipped outright: a
+      busy, responding bot is by definition alive, and the ping RPC is the
+      least reliable signal under that load. This is the fix for the periodic
+      "3 consecutive failures, forcing reconnect" every ~4 minutes during
+      transfers, which was canceling every running job.
     """
-    from bot.handlers.common import flood_blocked
+    from bot.handlers.common import bot_idle_seconds, flood_blocked
 
     consecutive_failures = 0
     required_failures = 3
     while True:
         await asyncio.sleep(config.BOT_WATCHDOG_INTERVAL)
+        if bot_idle_seconds() < config.BOT_ACTIVITY_SKIP:
+            # The bot has demonstrably done real work recently — not idle, not
+            # wedged. Reset the streak and keep listening.
+            consecutive_failures = 0
+            continue
         if flood_blocked():
             consecutive_failures = 0
             continue
