@@ -195,13 +195,26 @@ async def _cancel(bot, event, uid: int) -> None:
 
 
 async def _bot_alive(bot: TelegramClient, timeout: float | None = None) -> bool:
-    """Lightweight RPC round-trip used by the health watchdog."""
+    """Lightweight RPC round-trip used by the health watchdog.
+
+    ``FloodWaitError`` counts as *alive*: the MTProto link responded, the bot is
+    merely rate-limited, and forcing a reconnect in that state would only cancel
+    running transfers for no reason.
+    """
+    from telethon.errors import FloodWaitError
+
     try:
         await asyncio.wait_for(
             bot(GetNearestDcRequest()), timeout=timeout or config.BOT_PING_TIMEOUT
         )
         return True
-    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+    except FloodWaitError:
+        return True
+    except asyncio.CancelledError:
+        raise
+    except (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError):
+        return False
+    except Exception:  # noqa: BLE001 - any other error means the link is dead
         return False
 
 
@@ -212,17 +225,35 @@ async def _bot_health_watchdog(bot: TelegramClient) -> None:
     MTProto link wedges without raising, the process would sit frozen forever.
     This watchdog detects that and breaks the loop so :func:`main` reconnects.
 
-    A single transient failure is tolerated because Telegram MTProto pings
-    can sporadically fail without the link being actually dead.
+    False-positive protections:
+
+    * The check is purely monotonic-time based; no wall-clock timestamps and no
+      state carried over from a previous bot instance, so a fresh connection can
+      never be treated as "stale" (the old code had the same class of bug as the
+      transfer watchdog).
+    * A single transient failure is tolerated; we require ``required_failures``
+      (3) consecutive failures spanning ~90s before forcing a reconnect, so a
+      busy event loop or a sporadic slow ping does not kill the bot.
+    * While the bot account is flood-limited, pings fail spuriously even though
+      the link is perfectly alive, so those intervals are skipped entirely —
+      otherwise a transfer's progress edits would trigger a disconnect cascade.
     """
+    from bot.handlers.common import flood_blocked
+
     consecutive_failures = 0
-    required_failures = 2
+    required_failures = 3
     while True:
         await asyncio.sleep(config.BOT_WATCHDOG_INTERVAL)
-        if await _bot_alive(bot):
+        if flood_blocked():
             consecutive_failures = 0
             continue
-        consecutive_failures += 1
+        if not bot.is_connected():
+            consecutive_failures += 1
+        elif await _bot_alive(bot):
+            consecutive_failures = 0
+            continue
+        else:
+            consecutive_failures += 1
         if consecutive_failures >= required_failures:
             log.warning(
                 "bot health watchdog: %d consecutive failures, forcing reconnect",

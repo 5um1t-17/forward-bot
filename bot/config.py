@@ -45,8 +45,10 @@ class Config:
     # so a single file is latency-bound (~part size / round-trip). These knobs
     # make each large file fetch several parts concurrently, which multiplies
     # the effective per-file download speed without changing the number of
-    # simultaneous files. Set DOWNLOAD_PARTS to 1 to disable.
-    DOWNLOAD_PARTS: int = int(os.getenv("DOWNLOAD_PARTS", "6"))
+    # simultaneous files. The strict queue architecture runs ONE download at a
+    # time and ONE part at a time, so the default is 1 (parallel parts are an
+    # explicit opt-in via DOWNLOAD_PARTS>1).
+    DOWNLOAD_PARTS: int = int(os.getenv("DOWNLOAD_PARTS", "1"))
     DOWNLOAD_PARALLEL_MIN: int = int(os.getenv("DOWNLOAD_PARALLEL_MIN", str(1 * 1024 * 1024)))
 
     FETCH_DIALOGS_TIMEOUT: int = int(os.getenv("FETCH_DIALOGS_TIMEOUT", "60"))
@@ -92,6 +94,11 @@ class Config:
     # UI "Unlimited" retry setting). After this the item is counted as failed so
     # the queue always keeps moving.
     MAX_ITEM_RETRY_SECONDS: float = float(os.getenv("MAX_ITEM_RETRY_SECONDS", "900"))
+
+    # How often the run-level watchdog re-checks for forward progress. This is a
+    # pure detection cadence (the threshold is MAX_ITEM_RETRY_SECONDS), so a
+    # short value never causes a false "stuck" report by itself.
+    WATCHDOG_INTERVAL: float = float(os.getenv("WATCHDOG_INTERVAL", "30"))
 
     # Timeout for the bot's own progress-message edits. Edits are decoupled from
     # the transfer engine, so a slow edit can never stall a transfer.

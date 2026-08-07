@@ -251,6 +251,12 @@ class TransferEngine:
         # retry safety: a per-item deadline guarantees the queue always moves
         self._item_deadline: float = 0.0
         self._last_refresh_ts: float = 0.0
+        # Run-level watchdog anchor: a monotonic timestamp of the *last real
+        # forward progress* (job start, item start, or actual byte movement).
+        # It is (re)initialised at the top of every run() so a stale value from
+        # a previous job can never leak into the next one, and it is always a
+        # value from the same time.monotonic() clock — never 0.0.
+        self._last_activity_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # control
@@ -414,6 +420,10 @@ class TransferEngine:
                 "eta": (total - received) / speed if speed > 0 and total else 0.0,
             })
             self._operation = operation
+            # Real byte progress means the pipeline is alive: refresh the
+            # run-level watchdog anchor so a slow-but-progressing transfer is
+            # never mistaken for a stall.
+            self._last_activity_ts = time.monotonic()
 
         return cb
 
@@ -440,15 +450,23 @@ class TransferEngine:
         self._client = client
         self._refresh_client = refresh_client
         self._last_refresh_ts = 0.0
+        # Reset every watchdog / queue timer for this job. Using the *current*
+        # monotonic clock value means the run-level watchdog can never inherit
+        # a timestamp from a previous job, and can never be tripped by the host
+        # having been up for a long time (see _run_watchdog).
+        self._current_index = 0
+        self._item_deadline = 0.0
+        self._last_activity_ts = time.monotonic()
         result = TransferResult(total=len(cfg.message_ids))
         start = time.monotonic()
         state_builder = lambda: self._progress_state(result, cfg, start)  # noqa: E731
         log.info(
-            "Worker started: mode=%s total=%d forward_delay=%s threads=%s",
+            "Worker started: mode=%s total=%d forward_delay=%s "
+            "architecture=strict download_workers=1 upload_workers=1 intra_file_parts=%s",
             cfg.mode,
             len(cfg.message_ids),
             cfg.forward_delay,
-            cfg.threads,
+            config.DOWNLOAD_PARTS,
         )
         self.cleanup_stale_temp()
         if progress_cb is not None:
@@ -492,6 +510,9 @@ class TransferEngine:
                 if progress_cb is not None:
                     await progress_cb(state_builder())
                 self._item_deadline = time.monotonic() + config.MAX_ITEM_RETRY_SECONDS
+                # Reset the run watchdog anchor when a new item begins so a
+                # previous item's timer can never carry over to this one.
+                self._last_activity_ts = time.monotonic()
                 try:
                     await self._process_item(
                         cfg, item, result, reply_map, skip_idx=i,
@@ -579,11 +600,14 @@ class TransferEngine:
             if self._stop.is_set():
                 break
             chunk = ids[chunk_start:chunk_start + config.BATCH_SIZE]
+            log.debug("pipeline: collect chunk %d..%d (%d msgs)", chunk_start, chunk_start + len(chunk), len(chunk))
             msgs, failed = await self._fetch_existing(cfg.source_entity, chunk)
+            log.debug("pipeline: collect chunk returned %d msgs, %d failed", len(msgs), failed)
             if failed:
                 log.warning("skipping %d message(s): chunk fetch failed", failed)
                 fetch_failed += failed
             items.extend(self._build_items(msgs, cfg))
+        log.debug("pipeline: collected %d items from %d ids (%d fetch failures)", len(items), len(ids), fetch_failed)
         return items, fetch_failed
 
     # ------------------------------------------------------------------
@@ -597,11 +621,13 @@ class TransferEngine:
         while True:
             if self._stop.is_set():
                 return [], len(chunk)
+            log.debug("pipeline: get_messages await chunk=%d msgs (attempt %d)", len(chunk), attempts)
             try:
                 found = await asyncio.wait_for(
                     self._client.get_messages(source, ids=chunk),
                     timeout=config.MSG_FETCH_TIMEOUT,
                 )
+                log.debug("pipeline: get_messages returned %d msgs", len(found) if isinstance(found, list) else 1)
             except (MessageIdInvalidError, ValueError):
                 found = []
             except asyncio.CancelledError:
@@ -655,27 +681,42 @@ class TransferEngine:
                 log.debug("heartbeat progress update failed", exc_info=True)
 
     async def _run_watchdog(self) -> None:
-        """Abort the run if the engine hasn't advanced to a new item for too long.
+        """Abort the run if the engine makes no forward progress for too long.
 
-        Monitors ``_current_index`` every 30s. If the index hasn't changed for
-        more than ``MAX_ITEM_RETRY_SECONDS``, the engine is considered stuck
-        and ``request_stop()`` is called so the caller can recover.
+        The check is ``time.monotonic() - self._last_activity_ts`` where
+        ``_last_activity_ts`` is (re)set at job start, at every item start and
+        whenever real download/upload bytes advance. That makes the watchdog:
+
+        * immune to stale timestamps from a previous job (the anchor is always
+          re-initialised from the same monotonic clock at the top of run()),
+        * immune to the host's monotonic clock having run for a long time (a
+          deadline of ``0.0`` is never subtracted — the old code did exactly
+          that and tripped the moment the host had been up > MAX_ITEM_RETRY_SECONDS,
+          which is why a fresh worker reported "stuck on item 0 for >900s" 30s
+          after starting),
+        * correct in both directions: it fires only when *no* forward progress
+          has happened for longer than ``MAX_ITEM_RETRY_SECONDS``, and it never
+          fires while the run is paused.
+
+        Hung *operations* (a single download/upload that stops reporting bytes)
+        are handled by ``_guard``'s per-op stall watchdog + hard timeouts; this
+        run-level watchdog is the last-resort backstop for a completely wedged
+        loop.
         """
         stall_limit = config.MAX_ITEM_RETRY_SECONDS
-        check_interval = 30.0
-        last_index = self._current_index
+        check_interval = config.WATCHDOG_INTERVAL
         while True:
             await asyncio.sleep(check_interval)
             if self._stop.is_set():
                 break
-            if self._current_index != last_index:
-                last_index = self._current_index
+            # A deliberate user pause is not a stall — never kill a paused run.
+            if self._paused:
                 continue
-            if time.monotonic() - self._item_deadline > stall_limit:
+            elapsed = time.monotonic() - self._last_activity_ts
+            if elapsed > stall_limit:
                 log.warning(
-                    "Watchdog: engine stuck on item %d for >%.0fs, forcing stop",
-                    self._current_index,
-                    stall_limit,
+                    "Watchdog: no forward progress for >%.0fs (item %d, last activity %.0fs ago); forcing stop",
+                    stall_limit, self._current_index, elapsed,
                 )
                 self.request_stop()
                 break
@@ -758,6 +799,7 @@ class TransferEngine:
         if self._pause_evt.is_set():
             raise _Paused()
         task = asyncio.create_task(coro)
+        op_start = time.monotonic()
         last_ts = time.monotonic()
         last_prog = progress() if progress is not None else None
         seen_progress = progress is not None and last_prog is not None
@@ -766,7 +808,9 @@ class TransferEngine:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=config.CONTROL_POLL)
                 if task in done:
-                    return task.result()
+                    result = task.result()
+                    log.debug("pipeline: op %s completed after %.2fs", opname, time.monotonic() - op_start)
+                    return result
                 now = time.monotonic()
                 if self._stop.is_set():
                     log.info("Stop detected in %s, cancelling", opname)
@@ -835,7 +879,18 @@ class TransferEngine:
         ext = _media_extension(msg)
         tmp_path = os.path.join(tempfile.gettempdir(), f"fwd_{uuid.uuid4().hex}{ext}")
         temp_paths.add(tmp_path)
-        self._file_dl = None
+        # Seed the download snapshot so the _guard stall watchdog is armed from
+        # the very first poll (done=0, not None). Without this a download whose
+        # first progress report never arrives (e.g. the parallel part-path
+        # wedging on its first request) would report no progress, keep
+        # seen_progress=False and hang forever.
+        self._file_dl = {
+            "filename": _msg_filename(msg) or f"message_{msg.id}",
+            "done": 0,
+            "total": 0,
+            "speed": 0.0,
+            "eta": 0.0,
+        }
         progress = self._file_progress_cb(
             _msg_filename(msg) or f"message_{msg.id}", "Downloading", "dl"
         )
@@ -864,11 +919,19 @@ class TransferEngine:
         return path
 
     async def _download_media(self, msg, tmp_path: str, progress) -> str | None:
-        """Download one message's media, parallelising large documents."""
+        """Download one message's media, optionally parallelising large documents."""
         media = msg.media
         doc = media.document if isinstance(media, types.MessageMediaDocument) else None
         size = int(getattr(doc, "size", 0) or 0)
-        if doc is not None and size >= config.DOWNLOAD_PARALLEL_MIN:
+        log.debug("pipeline: _download_media enter msg=%d size=%d path=%s", msg.id, size, tmp_path)
+        # Strict queue architecture: ONE download at a time and (by default) one
+        # part at a time. Intra-file part-parallelism is an explicit opt-in via
+        # DOWNLOAD_PARTS > 1; it never changes the number of simultaneous files.
+        if (
+            doc is not None
+            and size >= config.DOWNLOAD_PARALLEL_MIN
+            and config.DOWNLOAD_PARTS > 1
+        ):
             location = types.InputDocumentFileLocation(
                 id=doc.id,
                 access_hash=doc.access_hash,
@@ -876,9 +939,12 @@ class TransferEngine:
                 thumb_size="",
             )
             try:
-                return await self._download_media_parallel(
+                log.debug("pipeline: parallel download start msg=%d parts=%d", msg.id, config.DOWNLOAD_PARTS)
+                result = await self._download_media_parallel(
                     location, size, tmp_path, progress, config.DOWNLOAD_PARTS
                 )
+                log.debug("pipeline: parallel download done msg=%d", msg.id)
+                return result
             except _Paused:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -887,12 +953,19 @@ class TransferEngine:
                     os.remove(tmp_path)
                 except OSError:
                     pass
-        return await self._guard(
-            self._client.download_media(msg, file=tmp_path, progress_callback=progress),
-            progress=self._dl_progress,
-            stall_timeout=config.STALL_TIMEOUT,
-            opname=f"download msg={msg.id}",
-        )
+        log.debug("pipeline: sequential download await msg=%d", msg.id)
+        try:
+            result = await self._guard(
+                self._client.download_media(msg, file=tmp_path, progress_callback=progress),
+                progress=self._dl_progress,
+                stall_timeout=config.STALL_TIMEOUT,
+                opname=f"download msg={msg.id}",
+            )
+        except Exception:
+            log.debug("pipeline: sequential download raised msg=%d", msg.id, exc_info=True)
+            raise
+        log.debug("pipeline: sequential download returned msg=%d", msg.id)
+        return result
 
     async def _download_media_parallel(
         self, location, file_size: int, dest_path: str,
@@ -933,23 +1006,39 @@ class TransferEngine:
                 limit=num,
             )
             pos = offset
+            log.debug(
+                "pipeline: parallel worker %d start offset=%d parts=%d", i, offset, num
+            )
             with open(dest_path, "r+b") as f:
                 async for chunk in iterator:
                     f.seek(pos)
                     f.write(chunk)
                     report(len(chunk))
                     pos += len(chunk)
+                    log.debug(
+                        "pipeline: parallel worker %d chunk +%d (pos=%d)", i, len(chunk), pos
+                    )
+            log.debug("pipeline: parallel worker %d done (offset=%d)", i, offset)
 
         async def run_workers() -> str:
+            log.debug("pipeline: parallel download gather start (%d workers)", n)
             await asyncio.gather(*(asyncio.create_task(worker(i)) for i in range(n)))
+            log.debug("pipeline: parallel download gather complete")
             return dest_path
 
-        return await self._guard(
-            run_workers(),
-            progress=self._dl_progress,
-            stall_timeout=config.STALL_TIMEOUT,
-            opname=f"parallel download ({file_size / (1024 * 1024):.0f} MB)",
-        )
+        log.debug("pipeline: parallel download guard start (file_size=%d)", file_size)
+        try:
+            result = await self._guard(
+                run_workers(),
+                progress=self._dl_progress,
+                stall_timeout=config.STALL_TIMEOUT,
+                opname=f"parallel download ({file_size / (1024 * 1024):.0f} MB)",
+            )
+        except Exception:
+            log.debug("pipeline: parallel download guard raised", exc_info=True)
+            raise
+        log.debug("pipeline: parallel download guard returned")
+        return result
 
 
     @staticmethod
@@ -1030,6 +1119,9 @@ class TransferEngine:
                         if remaining <= 0:
                             break
                         self._flood_wait = remaining
+                        # Sleeping through a flood wait is legitimate forward
+                        # movement: keep the run watchdog satisfied.
+                        self._last_activity_ts = time.monotonic()
                         if progress_cb is not None and state_builder is not None:
                             await progress_cb(state_builder())
                         ok = await self._sleep_interruptible(
@@ -1326,7 +1418,9 @@ class TransferEngine:
                 if is_album:
                     pairs: list = []
                     for m in media_msgs:
+                        log.debug("pipeline: album download await msg=%d", m.id)
                         path = await self._download_one(m, temp_paths)
+                        log.debug("pipeline: album download returned msg=%d path=%s", m.id, path)
                         if path:
                             pairs.append((m, path))
                     if pairs:
@@ -1339,7 +1433,14 @@ class TransferEngine:
                         up_cb = self._file_progress_cb(
                             _msg_filename(pairs[0][0]) or "album", "Uploading", "up"
                         )
-                        self._file_up = None
+                        self._file_up = {
+                            "filename": _msg_filename(pairs[0][0]) or "album",
+                            "done": 0,
+                            "total": 0,
+                            "speed": 0.0,
+                            "eta": 0.0,
+                        }
+                        log.debug("pipeline: album upload await (%d files)", len(pairs))
                         sent = await self._guard(
                             self._client.send_file(
                                 cfg.dest_entity,
@@ -1352,6 +1453,7 @@ class TransferEngine:
                             stall_timeout=config.STALL_TIMEOUT,
                             opname=f"upload album ({len(pairs)} files)",
                         )
+                        log.debug("pipeline: album upload returned (%d files)", len(pairs))
                         if isinstance(sent, list) and len(sent) == len(pairs):
                             for (m, _), s in zip(pairs, sent):
                                 reply_map[m.id] = s.id
@@ -1364,13 +1466,24 @@ class TransferEngine:
                             raise _Abort()
                         self._file_dl = None
                         self._file_up = None
+                        log.debug("pipeline: download await msg=%d", m.id)
                         path = await self._download_one(m, temp_paths)
+                        log.debug("pipeline: download returned msg=%d path=%s", m.id, path)
                         if not path:
                             continue
                         up_cb = self._file_progress_cb(
                             _msg_filename(m) or f"message_{m.id}", "Uploading", "up"
                         )
-                        self._file_up = None
+                        # Seed the upload snapshot so the _guard stall watchdog is
+                        # armed from the first poll (done=0), never None.
+                        self._file_up = {
+                            "filename": _msg_filename(m) or f"message_{m.id}",
+                            "done": 0,
+                            "total": 0,
+                            "speed": 0.0,
+                            "eta": 0.0,
+                        }
+                        log.debug("pipeline: upload await msg=%d", m.id)
                         sent = await self._guard(
                             self._client.send_file(
                                 cfg.dest_entity,
@@ -1386,6 +1499,7 @@ class TransferEngine:
                             stall_timeout=config.STALL_TIMEOUT,
                             opname=f"upload msg={m.id}",
                         )
+                        log.debug("pipeline: upload returned msg=%d", m.id)
                         reply_map[m.id] = sent.id
                         log.info(
                             "item msg=%d downloaded+uploaded (%.1f MB)",

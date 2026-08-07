@@ -1,7 +1,9 @@
 """Standalone smoke tests (no live Telegram API needed)."""
 import asyncio
+import contextlib
 import os
 import tempfile
+import time
 
 os.environ.setdefault("API_ID", "0")
 os.environ.setdefault("API_HASH", "x")
@@ -532,6 +534,146 @@ async def test_fetch_failure_accounted_not_hung():
     print("fetch failure accounted, run completed OK")
 
 
+async def test_watchdog_no_false_positive_during_collection():
+    """Regression test for the production bug: a fresh worker must never be
+    reported as 'stuck on item 0 for >900s' a few seconds after starting.
+
+    The old watchdog computed ``time.monotonic() - self._item_deadline`` where
+    ``_item_deadline`` was 0.0 until the first item began. On a host that had
+    been up longer than MAX_ITEM_RETRY_SECONDS (the norm on Render), that
+    expression was always > 900, so the very first watchdog check during
+    message collection falsely aborted the run.
+
+    The new watchdog anchors on ``_last_activity_ts`` which is always set from
+    the same monotonic clock at job start and at every item start, so even on a
+    host with a huge monotonic base value the elapsed time is ~0 while work is
+    happening.
+    """
+    import bot.config as bconfig
+    import bot.transfer_engine as te
+
+    real_mono = time.monotonic
+    base = 1_000_000.0  # host up for ~11.5 days
+
+    # A pure offset keeps time deltas identical, so asyncio's own timers still
+    # work while the engine sees a large monotonic base value.
+    def fake_mono():
+        return base + real_mono()
+
+    old_limit = bconfig.config.MAX_ITEM_RETRY_SECONDS
+    old_interval = bconfig.config.WATCHDOG_INTERVAL
+    te.time.monotonic = fake_mono
+    try:
+        bconfig.config.MAX_ITEM_RETRY_SECONDS = 900
+        bconfig.config.WATCHDOG_INTERVAL = 0.02  # aggressive watchdog checks
+
+        src = FakeEntity(1)
+        dst = FakeEntity(2)
+        msgs = [FakeMessage(i, text=f"m{i}") for i in range(1, 51)]
+
+        class SlowFetchClient(FakeClient):
+            async def get_messages(self, source, ids=None):
+                # Collection outlives several watchdog wake-ups, so the first
+                # check fires while item 0 has not even started.
+                await asyncio.sleep(0.05)
+                return await super().get_messages(source, ids=ids)
+
+        client = SlowFetchClient(msgs)
+        eng = TransferEngine()
+        cfg = TransferConfig(source_entity=src, dest_entity=dst,
+                             message_ids=list(range(1, 51)), mode="forward",
+                             threads=5, dedup=False, sid="abc")
+        result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+        assert not result.cancelled, result
+        assert result.success == 50, result
+        print("watchdog no false positive during collection OK")
+    finally:
+        te.time.monotonic = real_mono
+        bconfig.config.MAX_ITEM_RETRY_SECONDS = old_limit
+        bconfig.config.WATCHDOG_INTERVAL = old_interval
+
+
+async def test_watchdog_fires_on_real_stall():
+    """A run that genuinely stops making forward progress must still be aborted
+    by the run-level watchdog (it must not be permanently disabled)."""
+    import bot.config as bconfig
+
+    old_limit = bconfig.config.MAX_ITEM_RETRY_SECONDS
+    old_interval = bconfig.config.WATCHDOG_INTERVAL
+    bconfig.config.MAX_ITEM_RETRY_SECONDS = 0.2
+    bconfig.config.WATCHDOG_INTERVAL = 0.05
+    try:
+        eng = TransferEngine()
+        eng._last_activity_ts = time.monotonic() - 5.0  # genuinely stalled
+        task = asyncio.create_task(eng._run_watchdog())
+        await asyncio.wait_for(task, timeout=3)
+        assert eng._stop.is_set(), "watchdog should have fired on a real stall"
+        print("watchdog fires on real stall OK")
+    finally:
+        bconfig.config.MAX_ITEM_RETRY_SECONDS = old_limit
+        bconfig.config.WATCHDOG_INTERVAL = old_interval
+
+
+async def test_watchdog_ignores_paused_run():
+    """A deliberately paused run is not a stall: the watchdog must never kill it."""
+    import bot.config as bconfig
+
+    old_limit = bconfig.config.MAX_ITEM_RETRY_SECONDS
+    old_interval = bconfig.config.WATCHDOG_INTERVAL
+    bconfig.config.MAX_ITEM_RETRY_SECONDS = 0.2
+    bconfig.config.WATCHDOG_INTERVAL = 0.05
+    try:
+        eng = TransferEngine()
+        eng._last_activity_ts = time.monotonic() - 5.0
+        eng._paused = True
+        task = asyncio.create_task(eng._run_watchdog())
+        try:
+            await asyncio.sleep(0.3)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        assert not eng._stop.is_set(), "watchdog must not kill a paused run"
+        print("watchdog ignores paused run OK")
+    finally:
+        bconfig.config.MAX_ITEM_RETRY_SECONDS = old_limit
+        bconfig.config.WATCHDOG_INTERVAL = old_interval
+
+
+async def test_stall_watchdog_catches_no_first_progress():
+    """A download that never reports its first progress tick (e.g. a part-path
+    request wedging before the first byte) must still be cancelled by the stall
+    watchdog instead of hanging forever.
+
+    This guards the progress-seeding fix in _download_one: the download slot is
+    seeded to done=0 so _guard arms its stall watchdog from the very first poll
+    even before the first progress_callback fires.
+    """
+    import bot.config as bconfig
+
+    old_stall = bconfig.config.STALL_TIMEOUT
+    bconfig.config.STALL_TIMEOUT = 0.3
+    try:
+        src = FakeEntity(1)
+        dst = FakeEntity(2)
+        msgs = [_media_msg(1)]
+
+        class SilentDownloadClient(FakeClient):
+            async def download_media(self, msg, file=None, progress_callback=None):
+                await asyncio.sleep(60)  # never reports progress
+
+        client = SilentDownloadClient(msgs)
+        eng = TransferEngine()
+        cfg = TransferConfig(source_entity=src, dest_entity=dst, message_ids=[1],
+                             mode="download", threads=1, retry_count=1,
+                             dedup=False, sid="abc")
+        result = await asyncio.wait_for(eng.run(client, cfg), timeout=15)
+        assert result.success == 0 and result.failed == 1, result
+        print("stall watchdog catches no-first-progress download OK")
+    finally:
+        bconfig.config.STALL_TIMEOUT = old_stall
+
+
 async def main():
     test_parse_input()
     test_filter()
@@ -550,6 +692,10 @@ async def main():
     await test_item_retry_deadline_caps_unlimited()
     await test_stall_watchdog_cancels_frozen_download()
     await test_fetch_failure_accounted_not_hung()
+    await test_watchdog_no_false_positive_during_collection()
+    await test_watchdog_fires_on_real_stall()
+    await test_watchdog_ignores_paused_run()
+    await test_stall_watchdog_catches_no_first_progress()
     print("ALL TESTS PASSED")
 
 
