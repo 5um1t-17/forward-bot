@@ -30,6 +30,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"bot not ready")
 
+    def do_HEAD(self):
+    self.do_GET()
+ 
     def log_message(self, format, *args) -> None:
         pass
 
