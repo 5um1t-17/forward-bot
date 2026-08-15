@@ -1,0 +1,1229 @@
+"""Transfer wizard: source -> destination -> count -> mode -> options ->
+filter -> dedup -> schedule -> run / save as job."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from telethon import events
+from telethon.errors import FloodWaitError, MessageNotModifiedError, MessageIdInvalidError
+
+from bot import keyboards, text
+from bot.client_pool import client_pool
+from bot.config import config
+from bot.db import db, now
+from bot.entity_resolver import fetch_sendable_dialogs, parse_input, resolve, resolve_forwarded, _resolve_private_channel
+from bot.handlers.common import answer, edit
+from bot.scheduler import _compute_next, schedule_instant
+from bot.state import TransferWizard, store
+from bot.transfer_engine import (
+    TransferConfig,
+    TransferEngine,
+    TransferResult,
+    filter_label,
+)
+
+log = logging.getLogger("bot.transfer")
+
+engine = TransferEngine()
+
+_ACTIONS = {"tr"}
+
+
+async def handle(bot, event: events.CallbackQuery.Event, data: str) -> bool:
+    if data.startswith(("tr:", "dst:")) or data == "tr":
+        return await _route(bot, event, data)
+    return False
+
+
+async def _route(bot, event, data: str) -> bool:
+    uid = event.sender_id
+    if data == "tr:start":
+        return await _start_wizard(bot, event, uid)
+    if data == "tr:src:ok":
+        return await _next_to_dest(bot, event, uid)
+    if data == "tr:src:again":
+        return await _ask_source(bot, event, uid)
+    if data.startswith("tr:src:"):
+        return await _on_source_type(bot, event, uid, data.split(":", 2)[2])
+    if data.startswith("dst:sel:"):
+        return await _on_dest_sel(bot, event, uid, int(data.split(":", 2)[2]))
+    if data.startswith("dst:page:"):
+        return await _on_dest_page(bot, event, uid, int(data.split(":", 2)[2]))
+    if data == "dst:manual":
+        return await _ask_dest_manual(bot, event, uid)
+    if data == "dst:noop":
+        await answer(event)
+        return True
+    if data == "tr:dst:ok":
+        return await _ask_count(bot, event, uid)
+    if data == "tr:dst:again":
+        return await _ask_dest(bot, event, uid)
+    if data.startswith("tr:count:"):
+        return await _on_count(bot, event, uid, data.split(":", 2)[2])
+    if data.startswith("tr:mode:"):
+        return await _on_mode(bot, event, uid, data.split(":", 2)[2])
+    if data == "tr:opt:done":
+        return await _ask_filter(bot, event, uid)
+    if data.startswith("tr:opt:"):
+        return await _on_option(bot, event, uid, data.split(":", 2)[2])
+    if data == "tr:filter:done":
+        return await _ask_dedup(bot, event, uid)
+    if data.startswith("tr:filter:"):
+        return await _on_filter(bot, event, uid, data.split(":", 2)[2])
+    if data == "tr:dedup:toggle":
+        wiz = store.get_transfer(uid)
+        wiz.dedup = not wiz.dedup
+        await edit(event, text.dedup_prompt(wiz.dedup), keyboards.dedup_keyboard(wiz.dedup))
+        return True
+    if data == "tr:dedup:done":
+        return await _ask_schedule(bot, event, uid)
+    if data.startswith("tr:sched:"):
+        return await _on_schedule(bot, event, uid, data.split(":", 2)[2])
+    if data == "tr:run:start":
+        return await _run(bot, event, uid)
+    if data == "tr:run:stop":
+        return await _stop(bot, event, uid)
+    if data == "tr:run:pause":
+        return await _pause(bot, event, uid)
+    if data == "tr:run:resume":
+        return await _resume(bot, event, uid)
+    if data == "tr:run:skip":
+        return await _skip(bot, event, uid)
+    if data == "tr:run:stats":
+        return await _stats(bot, event, uid)
+    if data == "tr:run:refresh":
+        return await _refresh(bot, event, uid)
+    if data == "tr:run:savejob":
+        return await _ask_job_name(bot, event, uid)
+    if data == "tr:run:edit":
+        await edit(event, "✏️ Which step would you like to change?", keyboards.edit_keyboard())
+        return True
+    if data.startswith("tr:edit:"):
+        return await _edit_step(bot, event, uid, data.split(":", 2)[2])
+    return False
+
+
+async def _start_wizard(bot, event, uid: int) -> bool:
+    sid = await db.get_active_sid(uid)
+    if not sid:
+        await answer(event, text.err_no_account(), alert=True)
+        return True
+    store.reset_transfer(uid)
+    wiz = store.get_transfer(uid)
+    wiz.step = "source_type"
+    await edit(
+        event,
+        "📥 <b>Transfer Messages</b>\n\nWhat kind of source chat is it?\n"
+        "(This is used for validation only — auto-detect works too.)",
+        keyboards.source_type_keyboard(),
+    )
+    return True
+
+
+async def _on_source_type(bot, event, uid: int, stype: str) -> bool:
+    wiz = store.get_transfer(uid)
+    wiz.source_type = stype
+    return await _ask_source(bot, event, uid)
+
+
+async def _ask_source(bot, event, uid: int) -> bool:
+    store.set_pending(uid, "tr_source")
+    await edit(event, text.source_prompt(), keyboards.back_row())
+    return True
+
+
+async def _ask_dest_manual(bot, event, uid: int) -> bool:
+    store.set_pending(uid, "tr_dest_manual")
+    await edit(event, text.dest_prompt() + "\n\nSend the destination <b>link</b>, <b>username</b> or <b>ID</b> manually:", keyboards.back_row())
+    return True
+
+
+async def _on_dest_sel(bot, event, uid: int, dialog_id: int) -> bool:
+    wiz = store.get_transfer(uid)
+    for d in wiz.dialogs:
+        if d["id"] == dialog_id:
+            wiz.dest = {"id": dialog_id, "name": d["title"]}
+            await edit(event, text.dest_confirmed(d["title"], dialog_id), keyboards.dest_confirm_keyboard())
+            return True
+    await answer(event, "Dialog not found", alert=True)
+    return True
+
+
+async def _on_dest_page(bot, event, uid: int, page: int) -> bool:
+    wiz = store.get_transfer(uid)
+    wiz.dest_page = page
+    if not wiz.dialogs:
+        return await _ask_dest(bot, event, uid)
+    await edit(event, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, page))
+    return True
+
+
+async def _next_to_dest(bot, event, uid: int) -> bool:
+    return await _ask_dest(bot, event, uid)
+
+
+async def _fetch_dest_dialogs(uid: int) -> list[dict]:
+    log.info("dest step: fetching dialogs for user %s", uid)
+    sid = await asyncio.wait_for(db.get_active_sid(uid), timeout=5.0)
+    if not sid:
+        log.warning("dest step: no active session for user %s", uid)
+        return []
+    async with asyncio.timeout(config.CLIENT_CONNECT_TIMEOUT + 5):
+        client = await client_pool.get(uid, sid)
+    log.info("dest step: got client for user %s", uid)
+    # A pooled client can report connected while its MTProto link is dead;
+    # verify with a cheap RPC and rebuild before spending time on get_dialogs,
+    # so a half-dead connection can never hang the destination step.
+    from bot.client_pool import client_alive
+
+    if not await client_alive(client, timeout=5.0):
+        log.warning("pooled client for user %s is unresponsive; rebuilding", uid)
+        client = await client_pool.refresh(uid, sid)
+    dialogs = await fetch_sendable_dialogs(client, limit=200)
+    log.info("dest step: found %d dialogs for user %s", len(dialogs), uid)
+    return dialogs
+
+
+async def _ask_dest(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    store.set_pending(uid, None)
+    wiz.dest_page = 0
+    try:
+        await _do_ask_dest(bot, event, uid, wiz)
+    except asyncio.CancelledError:
+        raise
+    except FloodWaitError as exc:
+        log.warning("_ask_dest flood wait: %ss", exc.seconds)
+        try:
+            await event.answer(
+                f"⚠️ Telegram is rate-limiting the bot. Please wait ~{int(exc.seconds // 60)} min and try again.",
+                alert=True,
+            )
+        except Exception:
+            log.debug("flood alert answer failed", exc_info=True)
+    except Exception as exc:
+        log.warning("_ask_dest failed: %s", exc)
+        from bot.handlers.common import safe_send
+
+        await safe_send(bot, uid, "⚠️ Could not load your destination chats. Please try again.", keyboards.dest_manual_keyboard())
+    return True
+
+
+async def _edit_or_send(bot, event, uid: int, msg: str, kb) -> None:
+    """Edit the callback message; send a fresh message if it cannot be edited.
+
+    ``event.edit`` silently does nothing when the callback message is no
+    longer editable (deleted, or the click happened on a message the bot does
+    not own). Falling back to a new message guarantees the user always sees
+    the destination list / error instead of a stale "Loading..." screen.
+    """
+    from bot.handlers.common import flood_blocked, flood_remaining, safe_send
+
+    if await edit(event, msg, kb):
+        return
+    if flood_blocked():
+        log.info("send fallback skipped: bot flood-limited (%ds remaining)", int(flood_remaining()))
+        try:
+            await event.answer(
+                f"⚠️ Telegram is rate-limiting the bot. Please try again in ~{int(flood_remaining() // 60)} min.",
+                alert=True,
+            )
+        except Exception:
+            log.debug("flood alert answer failed", exc_info=True)
+        return
+    if await safe_send(bot, uid, msg, kb):
+        return
+    if flood_blocked():
+        try:
+            await event.answer(
+                f"⚠️ Telegram is rate-limiting the bot. Please try again in ~{int(flood_remaining() // 60)} min.",
+                alert=True,
+            )
+        except Exception:
+            log.debug("flood alert answer failed", exc_info=True)
+
+
+async def _do_ask_dest(bot, event, uid: int, wiz: TransferWizard) -> None:
+    log.info("dest step: entering _do_ask_dest for user %s", uid)
+    await edit(event, "⏳ Loading destination chats...", None)
+    try:
+        async with asyncio.timeout(config.FETCH_DIALOGS_TIMEOUT + 20):
+            wiz.dialogs = await _fetch_dest_dialogs(uid)
+    except asyncio.TimeoutError:
+        log.warning("destination dialog fetch timed out for user %s", uid)
+        await _edit_or_send(bot, event, uid, text.dest_timeout_prompt(), keyboards.dest_manual_keyboard())
+        return
+    except Exception as exc:
+        log.warning("dialogs failed: %s", exc)
+        await _edit_or_send(bot, event, uid, f"⚠️ Could not load your chats:\n<code>{str(exc)[:200]}</code>", keyboards.dest_manual_keyboard())
+        return
+    if not wiz.dialogs:
+        log.warning("dest step: no groups/channels for user %s", uid)
+        await _edit_or_send(bot, event, uid, "⚠️ No groups/channels found in this account.\n\nYou can still enter the destination manually.", keyboards.dest_manual_keyboard())
+        return
+    log.info("dest step: showing %d dialogs for user %s", len(wiz.dialogs), uid)
+    await _edit_or_send(bot, event, uid, text.dest_prompt(), keyboards.dest_keyboard(wiz.dialogs, 0))
+
+
+async def _ask_count(bot, event, uid: int) -> bool:
+    store.set_pending(uid, None)
+    await edit(event, text.count_prompt(), keyboards.count_keyboard())
+    return True
+
+
+async def _on_count(bot, event, uid: int, value: str) -> bool:
+    wiz = store.get_transfer(uid)
+    if value == "custom":
+        store.set_pending(uid, "tr_start_id")
+        await edit(event, text.custom_start_prompt(), keyboards.back_row())
+        return True
+    if value == "link":
+        store.set_pending(uid, "tr_link_start")
+        await edit(event, text.link_start_prompt(), keyboards.back_row())
+        return True
+    wiz.count_mode = "latest"
+    wiz.count = int(value)
+    return await _ask_mode(bot, event, uid)
+
+
+async def _ask_mode(bot, event, uid: int) -> bool:
+    store.set_pending(uid, None)
+    await edit(event, text.mode_prompt(), keyboards.mode_keyboard())
+    return True
+
+
+async def _on_mode(bot, event, uid: int, mode: str) -> bool:
+    wiz = store.get_transfer(uid)
+    wiz.mode = mode
+    if mode == "forward":
+        wiz.options.discard("hide_header")
+        wiz.options.add("keep_sender")
+        wiz.options.discard("text_only")
+        wiz.options.discard("media_only")
+    elif mode == "download":
+        wiz.options.discard("keep_sender")
+        wiz.options.discard("hide_header")
+        wiz.options.discard("text_only")
+        wiz.options.discard("media_only")
+    else:
+        wiz.options.discard("keep_sender")
+    await edit(event, text.options_prompt(mode, wiz.options), keyboards.options_keyboard(mode, wiz.options))
+    return True
+
+
+async def _on_option(bot, event, uid: int, key: str) -> bool:
+    wiz = store.get_transfer(uid)
+    opts = wiz.options
+    if key == "keep_sender":
+        if "keep_sender" in opts:
+            opts.discard("keep_sender")
+        else:
+            opts.add("keep_sender")
+            opts.discard("hide_header")
+            opts.discard("text_only")
+            opts.discard("media_only")
+    elif key == "hide_header":
+        if "hide_header" in opts:
+            opts.discard("hide_header")
+        else:
+            opts.add("hide_header")
+            opts.discard("keep_sender")
+            opts.discard("text_only")
+            opts.discard("media_only")
+    elif key == "remove_captions":
+        opts.symmetric_difference_update({"remove_captions"})
+    elif key == "text_only":
+        if "text_only" in opts:
+            opts.discard("text_only")
+        else:
+            opts.add("text_only")
+            opts.discard("media_only")
+            if wiz.mode in ("forward", "copy"):
+                wiz.mode = "copy"
+                opts.discard("keep_sender")
+    elif key == "media_only":
+        if "media_only" in opts:
+            opts.discard("media_only")
+        else:
+            opts.add("media_only")
+            opts.discard("text_only")
+            if wiz.mode in ("forward", "copy"):
+                wiz.mode = "copy"
+                opts.discard("keep_sender")
+    await edit(event, text.options_prompt(wiz.mode, opts), keyboards.options_keyboard(wiz.mode, opts))
+    return True
+
+
+async def _ask_filter(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    await edit(event, text.filter_prompt(), keyboards.filter_keyboard(wiz.filter_type))
+    return True
+
+
+async def _on_filter(bot, event, uid: int, key: str) -> bool:
+    wiz = store.get_transfer(uid)
+    wiz.filter_type = key
+    await edit(event, text.filter_prompt(), keyboards.filter_keyboard(wiz.filter_type))
+    return True
+
+
+async def _ask_dedup(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    await edit(event, text.dedup_prompt(wiz.dedup), keyboards.dedup_keyboard(wiz.dedup))
+    return True
+
+
+async def _ask_schedule(bot, event, uid: int) -> bool:
+    await edit(event, text.schedule_prompt(), keyboards.schedule_keyboard())
+    return True
+
+
+async def _on_schedule(bot, event, uid: int, kind: str) -> bool:
+    wiz = store.get_transfer(uid)
+    if kind == "now":
+        wiz.schedule_kind = "now"
+        wiz.schedule_time = None
+        wiz.schedule_weekday = None
+        return await _show_summary(bot, event, uid)
+    if kind == "weekly":
+        wiz.schedule_kind = "weekly"
+        await edit(event, text.schedule_weekday_prompt(), keyboards.weekday_keyboard())
+        return True
+    if kind.startswith("wd:"):
+        wiz.schedule_kind = "weekly"
+        wiz.schedule_weekday = int(kind.split(":", 1)[1])
+        store.set_pending(uid, "tr_sched_time")
+        await edit(event, text.schedule_time_prompt(), keyboards.back_row())
+        return True
+    if kind in ("daily", "later"):
+        wiz.schedule_kind = kind
+        store.set_pending(uid, "tr_sched_time")
+        await edit(event, text.schedule_time_prompt(), keyboards.back_row())
+        return True
+    return True
+
+
+async def _show_summary(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    cfg = {
+        "mode": wiz.mode,
+        "options": set(wiz.options),
+        "filter_type": wiz.filter_type,
+        "filter_label": filter_label(wiz.filter_type),
+        "dedup": wiz.dedup,
+        "schedule_kind": wiz.schedule_kind,
+        "schedule_time": wiz.schedule_time,
+        "schedule_weekday": wiz.schedule_weekday,
+    }
+    if wiz.count_mode == "latest":
+        cfg["count_label"] = f"Latest {wiz.count} (filtered)"
+    else:
+        cfg["count_label"] = f"IDs {wiz.custom_start} → {wiz.custom_end}"
+    await edit(event, text.summary(cfg, wiz.source, wiz.dest), keyboards.summary_keyboard())
+    return True
+
+
+async def _edit_step(bot, event, uid: int, step: str) -> bool:
+    if step == "src":
+        return await _ask_source(bot, event, uid)
+    if step == "dst":
+        return await _ask_dest(bot, event, uid)
+    if step == "count":
+        return await _ask_count(bot, event, uid)
+    if step == "mode":
+        return await _ask_mode(bot, event, uid)
+    if step == "opts":
+        wiz = store.get_transfer(uid)
+        await edit(event, text.options_prompt(wiz.mode, wiz.options), keyboards.options_keyboard(wiz.mode, wiz.options))
+        return True
+    if step == "filter":
+        return await _ask_filter(bot, event, uid)
+    if step == "dedup":
+        return await _ask_dedup(bot, event, uid)
+    if step == "sched":
+        return await _ask_schedule(bot, event, uid)
+    return True
+
+
+# ----------------------------------------------------------------------
+# run / stop / save
+# ----------------------------------------------------------------------
+async def _build_cfg(uid: int, wiz: TransferWizard) -> TransferConfig | None:
+    sid = await db.get_active_sid(uid)
+    if not sid:
+        return None
+    client = await client_pool.get(uid, sid)
+    try:
+        src_entity = await asyncio.wait_for(client.get_entity(wiz.source["id"]), timeout=30)
+        dst_entity = await asyncio.wait_for(client.get_entity(wiz.dest["id"]), timeout=30)
+    except asyncio.TimeoutError:
+        raise ValueError("Timed out resolving source or destination. Check the link/username/ID and try again.")
+    settings = await db.get_settings(uid)
+    if wiz.count_mode == "latest":
+        ids = await engine.collect_ids(client, src_entity, wiz.count, None, None, wiz.filter_type)
+    else:
+        ids = await engine.collect_ids(client, src_entity, None, wiz.custom_start, wiz.custom_end, wiz.filter_type)
+    cfg = TransferConfig(
+        source_entity=src_entity,
+        dest_entity=dst_entity,
+        message_ids=ids,
+        mode=wiz.mode,
+        options=set(wiz.options),
+        dedup=wiz.dedup,
+        threads=settings["threads"],
+        forward_delay=settings["forward_delay"],
+        retry_count=settings["retry_count"],
+        handle_flood=settings["handle_flood"],
+        auto_resume=settings["auto_resume"],
+        sid=sid,
+        source_name=wiz.source["name"],
+        dest_name=wiz.dest["name"],
+    )
+    cfg.total_planned = len(ids)
+    return cfg
+
+
+async def _run(bot, event, uid: int) -> bool:
+    if uid in store.running:
+        await answer(event, "A transfer is already running. Stop it first.", alert=True)
+        return True
+    wiz = store.get_transfer(uid)
+    try:
+        cfg = await _build_cfg(uid, wiz)
+    except Exception as exc:
+        log.warning("build cfg failed: %s", exc)
+        await edit(event, f"⚠️ Could not prepare the transfer:\n<code>{str(exc)[:300]}</code>", keyboards.back_row())
+        return True
+    if cfg is None or not cfg.message_ids:
+        await edit(event, "⚠️ No messages matched your filters / range.", keyboards.back_row())
+        return True
+    result = await execute(bot, uid, cfg)
+    if result.error and result.success == 0 and not result.cancelled:
+        from bot.handlers.common import safe_send
+
+        await safe_send(bot, uid, f"⚠️ {result.error}", None)
+    return True
+
+
+async def execute(bot, uid: int, cfg: TransferConfig) -> TransferResult:
+    """Shared runner used by the wizard and saved jobs.
+
+    One progress message is edited in place by a background updater. The
+    engine pushes a rich snapshot (current message, file bytes, operation,
+    FloodWait countdown) which is rendered every ``PROGRESS_REFRESH`` seconds
+    and immediately after a message completes or is skipped.
+    """
+    settings = await db.get_settings(uid)
+    init_state = {
+        "total": cfg.total_planned,
+        "success": 0,
+        "skipped": 0,
+        "failed": 0,
+        "elapsed": 0.0,
+        "speed": 0.0,
+        "eta": 0.0,
+        "mode": cfg.mode,
+        "operation": "Resolving Link",
+        "paused": False,
+        "flood_wait": None,
+        "current": None,
+        "file_dl": None,
+        "file_up": None,
+        "source_name": cfg.source_name,
+        "dest_name": cfg.dest_name,
+    }
+    from bot.handlers.common import safe_send
+
+    progress_msg = await safe_send(
+        bot,
+        uid,
+        text.progress_text(init_state),
+        keyboards.running_keyboard(False),
+    )
+    if progress_msg is False:
+        # Bot is flood-limited right now; do not start a transfer whose
+        # progress can never be shown.
+        store.running.pop(uid, None)
+        store.progress.pop(uid, None)
+        return TransferResult(
+            total=cfg.total_planned,
+            success=0,
+            skipped=0,
+            failed=0,
+            duration=0.0,
+            error="Telegram is rate-limiting the bot. Try again later.",
+        )
+    engine_obj = TransferEngine()
+    store.running[uid] = engine_obj
+    snap = {
+        "running": True,
+        "engine": engine_obj,
+        "cfg": cfg,
+        "settings": settings,
+        "progress_msg_id": progress_msg.id,
+        "last_edit": 0.0,
+        "edit_lock": asyncio.Lock(),
+        "_done": 0,
+    }
+    store.progress[uid] = snap
+
+    async def _do_edit(force: bool = False) -> None:
+        """Perform one throttled message edit, bounded by ``EDIT_TIMEOUT``.
+
+        A slow bot edit can never stall anything: it is awaited under a hard
+        timeout and cancelled if the network wedges. Edits are rate-limited to
+        at most one per ``EDIT_MIN_INTERVAL`` even when forced, because a fast
+        transfer (many messages/sec) otherwise hammers Telegram's bot API with
+        hundreds of edit calls a minute and triggers a long FloodWaitError that
+        blocks *all* bot messages (including the destination chat list).
+        """
+        from bot.handlers.common import (
+            flood_blocked,
+            flood_remaining,
+            note_bot_activity,
+            note_flood,
+        )
+
+        current = store.progress.get(uid)
+        if current is None or not current.get("running"):
+            return
+        if flood_blocked():
+            log.info("progress edit skipped: bot flood-limited (%ds remaining)", int(flood_remaining()))
+            return
+        async with current["edit_lock"]:
+            now_t = time.monotonic()
+            if now_t - current["last_edit"] < config.EDIT_MIN_INTERVAL:
+                return
+            current["last_edit"] = now_t
+            try:
+                await asyncio.wait_for(
+                    bot.edit_message(
+                        uid,
+                        current["progress_msg_id"],
+                        text.progress_text(current),
+                        buttons=keyboards.running_keyboard(bool(current.get("paused"))),
+                        parse_mode="html",
+                    ),
+                    timeout=config.EDIT_TIMEOUT,
+                )
+                note_bot_activity()
+            except (MessageNotModifiedError, MessageIdInvalidError, asyncio.TimeoutError) as exc:
+                # MessageNotModifiedError / MessageIdInvalidError mean Telegram
+                # answered (link is alive); only the timeout is inconclusive.
+                if not isinstance(exc, asyncio.TimeoutError):
+                    note_bot_activity()
+            except FloodWaitError as exc:
+                log.warning("progress edit flood wait: %ss", exc.seconds)
+                await note_flood(exc.seconds)
+                note_bot_activity()  # the link responded, even if rate-limited
+            except Exception:
+                log.warning("progress edit failed for uid=%s msg=%s", uid, current.get("progress_msg_id"), exc_info=True)
+
+    async def render(force: bool = False) -> None:
+        """Awaitable bounded edit; used by the button handlers and updater."""
+        await _do_edit(force=force)
+
+    async def schedule_render(force: bool = False) -> None:
+        """Fire-and-forget bounded edit, coalesced to one pending task.
+
+        The engine's ``progress_cb`` uses this so a slow bot edit can never
+        block the transfer loop (the root cause of the freeze-on-Render bug).
+        """
+        current = store.progress.get(uid)
+        if current is None or not current.get("running"):
+            return
+        if current.get("render_pending"):
+            return
+        current["render_pending"] = True
+
+        async def _bounded() -> None:
+            try:
+                await _do_edit(force=force)
+            finally:
+                cur = store.progress.get(uid)
+                if cur is not None:
+                    cur["render_pending"] = False
+
+        asyncio.create_task(_bounded())
+
+    snap["render"] = render
+    snap["render_pending"] = False
+
+    async def updater() -> None:
+        while store.progress.get(uid, {}).get("running"):
+            await asyncio.sleep(config.PROGRESS_REFRESH)
+            try:
+                await render()
+            except Exception:
+                log.debug("updater render failed", exc_info=True)
+
+    update_task = asyncio.create_task(updater())
+
+    async def progress_cb(state: dict) -> None:
+        current = store.progress.get(uid)
+        if current is None:
+            return
+        done = state.get("success", 0) + state.get("skipped", 0) + state.get("failed", 0)
+        changed = done != current.get("_done", 0)
+        current.update({k: v for k, v in state.items() if k != "render"})
+        current["_done"] = done
+        # immediate refresh after a message completes / is skipped / pause
+        # toggles; throttled + coalesced so the engine never blocks on an edit
+        if changed or state.get("paused"):
+            await schedule_render(force=True)
+
+    log_id = await db.add_log(
+        {
+            "user_id": uid,
+            "sid": cfg.sid,
+            "source_id": cfg.source_entity.id,
+            "source_name": cfg.source_name,
+            "dest_id": cfg.dest_entity.id,
+            "dest_name": cfg.dest_name,
+            "mode": cfg.mode,
+            "total": cfg.total_planned,
+            "status": "running",
+        }
+    )
+
+    try:
+        client = await client_pool.get(uid, cfg.sid)
+
+        async def refresh_client():
+            # Rebuild the account client after repeated network errors so a
+            # dead MTProto connection self-heals mid-run.
+            try:
+                return await client_pool.refresh(uid, cfg.sid)
+            except Exception as exc:
+                log.warning("client refresh failed for user %s: %s", uid, exc)
+                return None
+
+        async with client_pool.use(uid, cfg.sid):
+            result = await engine_obj.run(
+                client=client,
+                cfg=cfg,
+                progress_cb=progress_cb,
+                refresh_client=refresh_client,
+            )
+    finally:
+        store.running.pop(uid, None)
+        update_task.cancel()
+        try:
+            await update_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        store.progress.pop(uid, None)
+
+    avg_speed = result.success / result.duration if result.duration > 0 else 0.0
+    if result.cancelled or result.error:
+        final_text = text.run_failed(
+            {"total": result.total, "success": result.success, "skipped": result.skipped, "failed": result.failed},
+            result.duration,
+            result.error,
+            cfg.dest_name,
+        )
+    else:
+        final_text = text.run_done(
+            {"total": result.total, "success": result.success, "skipped": result.skipped, "failed": result.failed},
+            result.duration,
+            avg_speed,
+            cfg.dest_name,
+        )
+    try:
+        await bot.edit_message(uid, progress_msg.id, final_text, buttons=keyboards.run_done_keyboard(), parse_mode="html")
+    except Exception:
+        pass
+
+    await db.update_log(
+        log_id,
+        {
+            "status": "done",
+            "ended_at": now(),
+            "success": result.success,
+            "skipped": result.skipped,
+            "failed": result.failed,
+            "duration": result.duration,
+            "cancelled": result.cancelled,
+        },
+    )
+    return result
+
+
+async def _stop(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is not None:
+        engine_obj.request_stop()
+        await answer(event, "Stopping after the current message...")
+    else:
+        await answer(event, "Nothing is running")
+    return True
+
+
+async def _pause(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await answer(event, "Nothing is running", alert=True)
+        return True
+    engine_obj.request_pause()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["paused"] = True
+        snap["operation"] = "Paused"
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            log.warning("pause render failed for uid=%s", uid, exc_info=True)
+            try:
+                await bot.edit_message(
+                    uid,
+                    snap["progress_msg_id"],
+                    text.progress_text(snap),
+                    buttons=keyboards.running_keyboard(True),
+                    parse_mode="html",
+                )
+            except Exception:
+                log.warning("pause fallback edit failed for uid=%s", uid, exc_info=True)
+    await answer(event, "⏸ Paused — press Resume to continue")
+    return True
+
+
+async def _resume(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await answer(event, "Nothing is running", alert=True)
+        return True
+    engine_obj.request_resume()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["paused"] = False
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            log.warning("resume render failed for uid=%s", uid, exc_info=True)
+            try:
+                await bot.edit_message(
+                    uid,
+                    snap["progress_msg_id"],
+                    text.progress_text(snap),
+                    buttons=keyboards.running_keyboard(False),
+                    parse_mode="html",
+                )
+            except Exception:
+                log.warning("resume fallback edit failed for uid=%s", uid, exc_info=True)
+    await answer(event, "▶ Resumed")
+    return True
+
+
+async def _skip(bot, event, uid: int) -> bool:
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await answer(event, "Nothing is running", alert=True)
+        return True
+    engine_obj.request_skip()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["operation"] = "Skipping"
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            pass
+    await answer(event, "⏭ Skipping current message...")
+    return True
+
+
+async def cmd_skip(bot, event, uid: int) -> bool:
+    """Handle the /skip text command during a running transfer."""
+    engine_obj = store.running.get(uid)
+    if engine_obj is None:
+        await event.respond("Nothing is currently running.")
+        return True
+    engine_obj.request_skip()
+    snap = store.progress.get(uid)
+    if snap:
+        snap["operation"] = "Skipping"
+        try:
+            await snap["render"](force=True)
+        except Exception:
+            pass
+    await event.respond("⏭ Skipping current message...")
+    return True
+
+
+async def _stats(bot, event, uid: int) -> bool:
+    snap = store.progress.get(uid)
+    if not snap or not snap.get("running"):
+        await answer(event, "No active transfer", alert=True)
+        return True
+    try:
+        await snap["render"](force=True)
+    except Exception:
+        pass
+    await answer(
+        event,
+        f"✅ {snap.get('success', 0)}  ❌ {snap.get('failed', 0)}  "
+        f"⏭ {snap.get('skipped', 0)} · {snap.get('speed', 0.0):.1f} msg/s",
+    )
+    return True
+
+
+async def _refresh(bot, event, uid: int) -> bool:
+    """Force an immediate refresh of the live progress message."""
+    snap = store.progress.get(uid)
+    if not snap or not snap.get("running"):
+        await answer(event, "No active transfer to refresh", alert=True)
+        return True
+    try:
+        await snap["render"](force=True)
+    except Exception:
+        pass
+    await answer(event, "🔄 Progress refreshed")
+    return True
+
+
+async def _ask_job_name(bot, event, uid: int) -> bool:
+    store.set_pending(uid, "tr_job_name")
+    await edit(event, "💾 Give this transfer a <b>name</b> so you can run it again:", keyboards.back_row())
+    return True
+
+
+async def save_job(uid: int, wiz: TransferWizard, name: str) -> str:
+    settings = await db.get_settings(uid)
+    job = {
+        "user_id": uid,
+        "sid": await db.get_active_sid(uid),
+        "name": name,
+        "source": {"id": wiz.source["id"], "name": wiz.source["name"]},
+        "dest": {"id": wiz.dest["id"], "name": wiz.dest["name"]},
+        "count_mode": wiz.count_mode,
+        "count": wiz.count,
+        "custom_start": wiz.custom_start,
+        "custom_end": wiz.custom_end,
+        "mode": wiz.mode,
+        "options": sorted(wiz.options),
+        "filter_type": wiz.filter_type,
+        "dedup": wiz.dedup,
+        "threads": settings["threads"],
+        "forward_delay": settings["forward_delay"],
+        "retry_count": settings["retry_count"],
+        "handle_flood": settings["handle_flood"],
+        "auto_resume": settings["auto_resume"],
+        "schedule_kind": wiz.schedule_kind,
+        "schedule_time": wiz.schedule_time,
+        "schedule_weekday": wiz.schedule_weekday,
+    }
+    if wiz.schedule_kind == "later" and wiz.schedule_time:
+        job["status"] = "scheduled"
+        job["next_run"] = schedule_instant("later", wiz.schedule_time)
+    elif wiz.schedule_kind == "daily" and wiz.schedule_time:
+        job["status"] = "scheduled"
+        job["next_run"] = _compute_next("daily", wiz.schedule_time, None)
+    elif wiz.schedule_kind == "weekly" and wiz.schedule_time:
+        job["status"] = "scheduled"
+        job["next_run"] = _compute_next("weekly", wiz.schedule_time, wiz.schedule_weekday)
+    else:
+        job["status"] = "saved"
+    return await db.save_job(job)
+
+
+# ----------------------------------------------------------------------
+# pending text input
+# ----------------------------------------------------------------------
+async def handle_pending(bot, event: events.NewMessage.Event, kind: str) -> bool:
+    uid = event.sender_id
+    if kind == "tr_source":
+        return await _on_source_input(bot, event, uid)
+    if kind == "tr_dest_manual":
+        return await _on_dest_input(bot, event, uid)
+    if kind == "tr_start_id":
+        return await _on_start_id(bot, event, uid)
+    if kind == "tr_end_id":
+        return await _on_end_id(bot, event, uid)
+    if kind == "tr_sched_time":
+        return await _on_sched_time(bot, event, uid)
+    if kind == "tr_job_name":
+        return await _on_job_name(bot, event, uid)
+    if kind == "tr_link_start":
+        return await _on_link_start_input(bot, event, uid)
+    if kind == "tr_link_end":
+        return await _on_link_end_input(bot, event, uid)
+    return False
+
+
+async def _on_source_input(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    sid = await db.get_active_sid(uid)
+    if not sid:
+        await event.respond(text.err_no_account())
+        return True
+    try:
+        client = await client_pool.get(uid, sid)
+        if event.message.forward:
+            resolved = await asyncio.wait_for(
+                resolve_forwarded(client, event.message),
+                timeout=config.OP_TIMEOUT,
+            )
+        else:
+            resolved = await asyncio.wait_for(
+                resolve(client, event.raw_text),
+                timeout=config.OP_TIMEOUT,
+            )
+    except asyncio.TimeoutError:
+        log.warning("source resolve timed out for user %s", uid)
+        await event.respond("⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.")
+        return True
+    except ValueError as exc:
+        log.warning("source resolve error: %s", exc)
+        await event.respond("⚠️ Session issue: please go to 👤 Accounts → 🗑 Delete Account, then ➕ Add Account again.")
+        return True
+    except Exception as exc:
+        log.warning("source resolve error: %s", exc)
+        await event.respond(f"⚠️ Resolution failed: <code>{str(exc)[:200]}</code>")
+        return True
+    if resolved is None:
+        await event.respond("⚠️ Could not resolve that source. Send a valid link, username, ID, or a forwarded message.")
+        return True
+    wiz.source = {"id": resolved.chat_id, "name": resolved.title}
+    store.set_pending(uid, None)
+    await event.respond(text.source_confirmed(resolved.title, resolved.chat_id), buttons=keyboards.source_confirm_keyboard(), parse_mode="html")
+    return True
+
+
+async def _on_dest_input(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    sid = await db.get_active_sid(uid)
+    try:
+        client = await client_pool.get(uid, sid)
+        resolved = await asyncio.wait_for(
+            resolve(client, event.raw_text),
+            timeout=config.OP_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning("dest resolve timed out for user %s", uid)
+        await event.respond("⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.")
+        return True
+    except Exception as exc:
+        log.warning("dest resolve error: %s", exc)
+        await event.respond(f"⚠️ Resolution failed: <code>{str(exc)[:200]}</code>")
+        return True
+    if resolved is None:
+        await event.respond("⚠️ Could not resolve that destination. Send a valid link, username or ID.")
+        return True
+    wiz.dest = {"id": resolved.chat_id, "name": resolved.title}
+    store.set_pending(uid, None)
+    await event.respond(text.dest_confirmed(resolved.title, resolved.chat_id), buttons=keyboards.dest_confirm_keyboard(), parse_mode="html")
+    return True
+
+
+async def _on_start_id(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    value = event.raw_text.strip()
+    if not value.isdigit():
+        await event.respond("⚠️ Please send a number.")
+        return True
+    wiz.custom_start = int(value)
+    store.set_pending(uid, "tr_end_id")
+    await event.respond(text.custom_end_prompt())
+    return True
+
+
+async def _on_end_id(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    value = event.raw_text.strip()
+    if not value.isdigit():
+        await event.respond("⚠️ Please send a number.")
+        return True
+    wiz.custom_end = int(value)
+    wiz.count_mode = "custom"
+    store.set_pending(uid, None)
+    await _ask_mode(bot, event, uid)
+    return True
+
+
+async def _on_link_start_input(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    sid = await db.get_active_sid(uid)
+    if not sid:
+        await event.respond(text.err_no_account())
+        return True
+    try:
+        client = await client_pool.get(uid, sid)
+        parsed = parse_input(event.raw_text)
+        if parsed["kind"] == "unknown":
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123, https://t.me/joinchat/abc123/123, or https://t.me/c/123456789/123")
+            return True
+        if parsed["kind"] == "message_link":
+            if parsed.get("slug") == "c":
+                entity = await asyncio.wait_for(
+                    _resolve_private_channel(client, parsed["cid"]),
+                    timeout=config.OP_TIMEOUT,
+                )
+                if entity is None:
+                    await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
+                    return True
+            else:
+                identifier = parsed.get("identifier") or parsed.get("slug")
+                entity = await asyncio.wait_for(
+                    client.get_entity(identifier),
+                    timeout=config.OP_TIMEOUT,
+                )
+            msg_id = parsed.get("msg_id")
+        elif parsed["kind"] == "username":
+            entity = await asyncio.wait_for(
+                client.get_entity(parsed["username"]),
+                timeout=config.OP_TIMEOUT,
+            )
+            msg_id = None
+        elif parsed["kind"] == "channel_id":
+            entity = await asyncio.wait_for(
+                client.get_entity(parsed["id"]),
+                timeout=config.OP_TIMEOUT,
+            )
+            msg_id = None
+        else:
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/123, https://t.me/joinchat/abc123/123, or https://t.me/c/123456789/123")
+            return True
+        if msg_id is None:
+            await event.respond("⚠️ Please send a message link that includes the message ID, e.g. https://t.me/channel/123")
+            return True
+        wiz.source = {"id": entity.id, "name": getattr(entity, "title", getattr(entity, "username", str(entity.id)))}
+        wiz.custom_start = msg_id
+        store.set_pending(uid, "tr_link_end")
+        await event.respond(
+            f"✅ <b>Start message set</b> — <code>{msg_id}</code>\n\n"
+            f"Now send the <b>end message link</b> from the same chat.",
+            parse_mode="html",
+        )
+        return True
+    except asyncio.TimeoutError:
+        log.warning("link start resolve timed out for user %s", uid)
+        await event.respond(
+            "⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.",
+            parse_mode="html",
+        )
+        return True
+    except Exception as exc:
+        log.warning("link resolve error: %s", exc)
+        await event.respond(
+            f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>\n\n"
+            f"Make sure the link format is correct and your account has access to the chat.",
+            parse_mode="html",
+        )
+        return True
+
+
+async def _on_link_end_input(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    sid = await db.get_active_sid(uid)
+    if not sid:
+        await event.respond(text.err_no_account())
+        return True
+    try:
+        client = await client_pool.get(uid, sid)
+        parsed = parse_input(event.raw_text)
+        if parsed["kind"] == "unknown":
+            await event.respond("⚠️ Send a valid message link, e.g. https://t.me/channel/500, https://t.me/joinchat/abc123/500, or https://t.me/c/123456789/500")
+            return True
+        if parsed["kind"] == "message_link":
+            if parsed.get("slug") == "c":
+                end_entity = await asyncio.wait_for(
+                    _resolve_private_channel(client, parsed["cid"]),
+                    timeout=config.OP_TIMEOUT,
+                )
+                if end_entity is None:
+                    await event.respond("⚠️ Could not access this private channel. Make sure your account is a member.")
+                    return True
+                end_chat_id = end_entity.id
+            else:
+                end_identifier = parsed.get("identifier") or parsed.get("slug")
+                end_entity = await asyncio.wait_for(
+                    client.get_entity(end_identifier),
+                    timeout=config.OP_TIMEOUT,
+                )
+                end_chat_id = end_entity.id
+            end_msg_id = parsed.get("msg_id")
+        else:
+            await event.respond("⚠️ Send a message link with a message ID, not just a username or ID.")
+            return True
+        if wiz.source["id"] != end_chat_id:
+            await event.respond("⚠️ The end link must be from the same source chat as the start link.")
+            return True
+        if end_msg_id < wiz.custom_start:
+            await event.respond("⚠️ End message ID must be greater than start message ID.")
+            return True
+        wiz.custom_end = end_msg_id
+        wiz.count_mode = "custom"
+        store.set_pending(uid, None)
+        await event.respond(
+            f"✅ <b>Range set</b>\n\n"
+            f"From message <code>{wiz.custom_start}</code> to <code>{end_msg_id}</code>\n"
+            f"Total: <b>{end_msg_id - wiz.custom_start + 1}</b> messages",
+            parse_mode="html",
+        )
+        await event.respond(text.mode_prompt(), buttons=keyboards.mode_keyboard(), parse_mode="html")
+        return True
+    except asyncio.TimeoutError:
+        log.warning("link end resolve timed out for user %s", uid)
+        await event.respond(
+            "⚠️ Resolution timed out. The chat may be slow or inaccessible — try again in a moment.",
+            parse_mode="html",
+        )
+        return True
+    except Exception as exc:
+        log.warning("end link resolve error: %s", exc)
+        await event.respond(
+            f"⚠️ Could not resolve that link: <code>{str(exc)[:200]}</code>\n\n"
+            f"Make sure the link format is correct and your account has access to the chat.",
+            parse_mode="html",
+        )
+        return True
+
+
+async def _on_sched_time(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    value = event.raw_text.strip()
+    try:
+        hh, mm = (int(x) for x in value.split(":"))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError
+    except ValueError:
+        await event.respond("⚠️ Use <b>HH:MM</b> 24h format, e.g. <code>21:30</code>.")
+        return True
+    wiz.schedule_time = f"{hh:02d}:{mm:02d}"
+    store.set_pending(uid, None)
+    await _show_summary_from_message(bot, event, uid)
+    return True
+
+
+async def _on_job_name(bot, event, uid: int) -> bool:
+    wiz = store.get_transfer(uid)
+    name = event.raw_text.strip()[:50] or "Transfer"
+    store.set_pending(uid, None)
+    try:
+        jid = await save_job(uid, wiz, name)
+    except Exception as exc:
+        log.warning("save job failed: %s", exc)
+        await event.respond(f"⚠️ Could not save the job: <code>{str(exc)[:200]}</code>")
+        return True
+    await event.respond(text.job_saved(name, jid), buttons=keyboards.run_done_keyboard(), parse_mode="html")
+    return True
+
+
+async def _show_summary_from_message(bot, event, uid: int) -> None:
+    wiz = store.get_transfer(uid)
+    cfg = {
+        "mode": wiz.mode,
+        "options": set(wiz.options),
+        "filter_type": wiz.filter_type,
+        "filter_label": filter_label(wiz.filter_type),
+        "dedup": wiz.dedup,
+        "schedule_kind": wiz.schedule_kind,
+        "schedule_time": wiz.schedule_time,
+        "schedule_weekday": wiz.schedule_weekday,
+    }
+    if wiz.count_mode == "latest":
+        cfg["count_label"] = f"Latest {wiz.count} (filtered)"
+    else:
+        cfg["count_label"] = f"IDs {wiz.custom_start} → {wiz.custom_end}"
+    await event.respond(text.summary(cfg, wiz.source, wiz.dest), buttons=keyboards.summary_keyboard(), parse_mode="html")
